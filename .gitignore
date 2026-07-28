@@ -1,0 +1,33 @@
+# Xcode / build
+.build/
+DerivedData/
+build/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.swiftpm/
+Packages/
+Package.resolved
+
+# macOS
+.DS_Store
+**/.DS_Store
+*.swp
+*~
+
+# Secrets / local config
+*.pem
+.env
+.env.*
+
+# Playgrounds
+timeline.xctimeline
+playground.xcworkspace
