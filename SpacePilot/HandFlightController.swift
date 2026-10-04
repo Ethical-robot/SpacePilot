@@ -10,7 +10,6 @@ final class HandFlightController {
     private let worldTracking = WorldTrackingProvider()
     private weak var flight: FlightModel?
     private var trackingTask: Task<Void, Never>?
-    private var deviceTrackingTask: Task<Void, Never>?
     private var latestDeviceTransform: simd_float4x4?
 
     private var dominantHand: HandAnchor.Chirality?
@@ -25,6 +24,14 @@ final class HandFlightController {
     private var lastWalkingTrackingTime = 0.0
     private var walkingGestureBeganAt: Double?
     private var lastWalkingPoseMatchTime = 0.0
+    private var walkPinchWasActive = false
+    /// True after a deliberate walk hold long enough to count for run re-tap.
+    private var walkSolidHoldAchieved = false
+    /// Walk pinch broke after a solid hold; quick re-hold latches run.
+    private var walkBreakAwaitingRetap = false
+    private var lastWalkPinchReleaseTime = 0.0
+    private var runGestureLatched = false
+    private var lastKitPoseMatchTime = 0.0
     private var lastExplorationMode: String?
     private var leftPose: HandPose?
     private var rightPose: HandPose?
@@ -46,44 +53,44 @@ final class HandFlightController {
     private var eatingItemID: String?
     private var lastEatingFragmentTime = 0.0
     private var eatingGestureConsumed = false
+    /// Dominant thumb↔index pinch-drag yaws the forward / compass view.
+    private var seatedYawPinchActive = false
+    private var seatedYawLastHandPosition: SIMD3<Float>?
 
     func connect(to flight: FlightModel) {
         self.flight = flight
 
         guard HandTrackingProvider.isSupported else {
-            flight.handTrackingStatus = "Hand tracking unavailable"
+            flight.setHandTrackingStatus("Hand tracking unavailable")
             return
         }
 
+        applyConfiguredHandedness()
         if flight.activeExplorationMode == "Leave on foot" {
-            dominantHand = nil
-            secondaryHand = nil
-            flight.handTrackingStatus =
-                "Show the walking pose with either hand"
+            flight.setHandTrackingStatus(
+                "Thumb↔middle = walk • fist to face + thumb tucked = kit"
+            )
         } else if flight.isSurfaceExploration {
-            if flight.dominantHandName == "LEFT" {
-                dominantHand = .left
-            } else if flight.dominantHandName == "RIGHT" {
-                dominantHand = .right
-            }
-            flight.handTrackingStatus =
+            flight.setHandTrackingStatus(
                 "Close dominant hand to steer rover"
+            )
         } else {
-            flight.handTrackingStatus = "Grip joystick with thumb up"
+            flight.setHandTrackingStatus(
+                "Grip joystick with thumb up • fist kit opens inventory"
+            )
         }
         trackingTask = Task { [weak self] in
             guard let self else { return }
             do {
                 try await session.run([handTracking, worldTracking])
-                deviceTrackingTask = Task { [weak self] in
-                    await self?.trackDevicePose()
-                }
                 for await update in handTracking.anchorUpdates {
                     guard !Task.isCancelled else { break }
                     process(update.anchor)
                 }
             } catch {
-                flight.handTrackingStatus = "Hand tracking permission required"
+                flight.setHandTrackingStatus(
+                    "Hand tracking permission required"
+                )
             }
         }
     }
@@ -91,8 +98,6 @@ final class HandFlightController {
     func disconnect() {
         trackingTask?.cancel()
         trackingTask = nil
-        deviceTrackingTask?.cancel()
-        deviceTrackingTask = nil
         latestDeviceTransform = nil
         dominantHand = nil
         secondaryHand = nil
@@ -112,14 +117,37 @@ final class HandFlightController {
         resetActivationGesture()
         resetSurfaceToolGestureState()
         resetEatingGesture()
+        endSeatedViewYawPinch()
         flight?.setInventoryVisible(false)
         flight?.setWalkingGestureActive(false)
+        flight?.setRunningGestureActive(false)
+        flight?.setJetpackThrusting(false)
         clearJoystick()
         releaseThrottle()
         flight = nil
     }
 
+    /// Polled from the display-synced simulation frame so device pose shares
+    /// the same MainActor cadence as flight instead of a second sleep loop.
+    func pollDevicePose() {
+        guard let anchor = worldTracking.queryDeviceAnchor(
+            atTimestamp: CACurrentMediaTime()
+        ), anchor.isTracked else {
+            return
+        }
+        latestDeviceTransform = anchor.originFromAnchorTransform
+        let forward = -SIMD3<Float>(
+            anchor.originFromAnchorTransform.columns.2.x,
+            anchor.originFromAnchorTransform.columns.2.y,
+            anchor.originFromAnchorTransform.columns.2.z
+        )
+        flight?.setWalkingFacingDirection(forward)
+    }
+
     private func process(_ anchor: HandAnchor) {
+        // Keep head pose fresh for zone / facing checks even if a caller
+        // forgets to poll from the simulation loop.
+        pollDevicePose()
         let now = ProcessInfo.processInfo.systemUptime
         synchronizeExplorationMode()
         guard anchor.isTracked, let pose = pose(for: anchor) else {
@@ -132,66 +160,44 @@ final class HandFlightController {
             rightPose = pose
         }
 
-        if flight?.activeExplorationMode == "Leave on foot",
-           dominantHand == nil {
-            guard isWalkingRoleSelectionPose(pose) else {
-                flight?.handTrackingStatus =
-                    "Show the walking pose with either hand"
-                return
-            }
-            secondaryHand = anchor.chirality
-            dominantHand =
-                anchor.chirality == .left ? .right : .left
-            flight?.dominantHandName =
-                dominantHand == .left ? "LEFT" : "RIGHT"
-            flight?.saveProgress()
-        }
+        // Handedness is settings-driven only (default RIGHT). Never steal
+        // dominance from accidental opposite-hand gestures.
+        applyConfiguredHandedness()
 
-        if dominantHand == nil {
-            let canRestoreSurfaceControls =
-                flight?.isSurfaceExploration == true
-                    && pose.fingersCurled
-            guard canRestoreSurfaceControls
-                    || (pose.thumbIsUp && pose.fingersCurled) else {
-                return
+        if flight?.isPaused == true {
+            // Keep kit / settings usable while simulation is paused.
+            if flight?.isSettingsMenuPresented == true {
+                flight?.inventoryVisible = true
+            } else if flight?.canPresentInventory == true,
+                      anchor.chirality != dominantHand,
+                      isSurfaceKitFistPose(pose) {
+                lastKitPoseMatchTime = now
+                flight?.setHandSurfaceKitActive(true)
             }
-            dominantHand = anchor.chirality
-            joystickNeutral = pose.frame
-            flight?.grabJoystick(at: pose.fistPosition)
+            flight?.setHandTrackingStatus("Paused • Settings")
+            return
         }
 
         if anchor.chirality == dominantHand {
             lastJoystickTrackingTime = now
-            flight?.dominantHandActive = true
             flight?.dominantHandName =
-                dominantHand == .left ? "LEFT" : "RIGHT"
+                flight?.dominantHandSettingForCurrentMode.rawValue ?? "RIGHT"
+            if processSeatedViewYawPinch(pose) {
+                processActivationGesture(now: now)
+                if flight?.activeExplorationMode == "Leave on foot" {
+                    processToolMenuInteraction()
+                    processCollectionGesture()
+                }
+                return
+            }
+            flight?.setDominantHandActive(true)
             flight?.updateHeldInventoryItemPose(
                 position: pose.fistPosition,
                 pointingDirection: pose.wristToKnuckles
             )
             processEatingGesture(pose, now: now)
-        } else {
-            let walkingPoseReady =
-                flight?.activeExplorationMode == "Leave on foot"
-                    && isForgivingWalkingPose(pose)
-            let inventoryActive =
-                flight?.canPresentInventory == true
-                    && flight?.walkingGestureActive != true
-                    && !walkingPoseReady
-                    && pose.allDigitsSpread
-                    && isBackOfHandFacingUser(pose)
-            flight?.setInventoryVisible(inventoryActive)
-            if inventoryActive {
-                walkingGestureBeganAt = nil
-                flight?.setWalkingGestureActive(false)
-                flight?.setSurfaceToolMenuVisible(false)
-                flight?.supportHandActive = false
-                updateStatus()
-                return
-            }
+            processActivationGesture(now: now)
         }
-
-        processActivationGesture(now: now)
 
         if flight?.activeExplorationMode == "Leave on foot" {
             if anchor.chirality == dominantHand {
@@ -200,48 +206,84 @@ final class HandFlightController {
                     position: pose.fistPosition,
                     pointingDirection: pose.wristToKnuckles
                 )
-                processDominantSurfaceTool(pose, now: now)
+                // Dominant thumb↔middle = jetpack, but only when the thumb is
+                // not folded down for a tool trigger (that pose overlaps).
+                let jetpackPose =
+                    pose.thumbMiddlePinched
+                        && !pose.fingersCurled
+                        && pose.thumbFoldRatio > 0.98
+                        && isInWalkingActivationZone(pose.fistPosition)
+                flight?.setJetpackThrusting(jetpackPose)
+                if !jetpackPose {
+                    processDominantSurfaceTool(pose, now: now)
+                } else {
+                    flight?.stopMatterCrumblerBeam()
+                    lastMatterCrumblerUpdateTime = nil
+                    surfaceToolTriggerPressed = false
+                }
             } else {
                 lastWalkingTrackingTime = now
-                let palmFacingUser = isPalmFacingUser(pose)
-                let palmMenuActive =
-                    flight?.inventoryVisible != true
-                        && pose.fingersOutstretched
-                        && palmFacingUser
-                flight?.setSurfaceToolMenuVisible(palmMenuActive)
-                if palmMenuActive {
+                // Fist + thumb on fist, fingers toward you = tools + inventory.
+                // Thumb↔middle = walk; solid walk → brief break → hold = run.
+                let isFist = pose.fingersCurled
+                if isSurfaceKitFistPose(pose) {
+                    lastKitPoseMatchTime = now
+                    flight?.setHandSurfaceKitActive(true)
+                    // Strip sits just above the fist face presented to the user.
                     flight?.updateSurfaceToolMenuPose(
                         position:
                             pose.wrist
-                                - pose.wristToKnuckles * 0.045
-                                + pose.palmNormal * 0.018,
+                                + pose.wristToKnuckles * 0.04
+                                + pose.palmNormal * 0.05,
                         palmNormal: pose.palmNormal
                     )
+                } else if lastKitPoseMatchTime > 0,
+                          now - lastKitPoseMatchTime > 0.28 {
+                    lastKitPoseMatchTime = 0
+                    flight?.setHandSurfaceKitActive(false)
                 }
+                expireWalkRunRetapWindow(now: now)
                 let matchesWalkingGesture =
-                    !palmMenuActive
-                        && flight?.inventoryVisible != true
-                        && !palmFacingUser
-                        && isForgivingWalkingPose(pose)
+                    !isFist && isWalkingLocomotionPose(pose)
                 if matchesWalkingGesture {
                     lastWalkingPoseMatchTime = now
-                    if walkingGestureBeganAt == nil {
+                    if !walkPinchWasActive {
+                        // Rising edge after a solid walk hold + quick break → run.
+                        if walkBreakAwaitingRetap,
+                           walkSolidHoldAchieved,
+                           now - lastWalkPinchReleaseTime <= 0.40 {
+                            runGestureLatched = true
+                        }
+                        walkBreakAwaitingRetap = false
                         walkingGestureBeganAt = now
                     }
-                    let isWalking =
-                        now - (walkingGestureBeganAt ?? now) >= 0.10
-                    flight?.setWalkingGestureActive(isWalking)
-                    flight?.supportHandActive = isWalking
-                } else if flight?.walkingGestureActive == true,
-                          now - lastWalkingPoseMatchTime <= 0.35 {
-                    // Brief joint occlusion or one noisy finger must not
-                    // interrupt locomotion once the pose has latched.
+                    walkPinchWasActive = true
+                    if let began = walkingGestureBeganAt,
+                       now - began >= 0.12 {
+                        walkSolidHoldAchieved = true
+                    }
+                    // Snappy start; run latches on the re-hold edge above.
                     flight?.setWalkingGestureActive(true)
+                    flight?.setRunningGestureActive(runGestureLatched)
                     flight?.supportHandActive = true
+                } else if flight?.walkingGestureActive == true,
+                          now - lastWalkingPoseMatchTime <= 0.28 {
+                    // Brief joint occlusion must not interrupt locomotion or
+                    // count as the intentional break used for run.
+                    flight?.setWalkingGestureActive(true)
+                    flight?.setRunningGestureActive(runGestureLatched)
+                    flight?.setSupportHandActive(true)
                 } else {
+                    if walkPinchWasActive || flight?.walkingGestureActive == true {
+                        lastWalkPinchReleaseTime = now
+                        // Only arm run re-tap after a real solid walk hold.
+                        walkBreakAwaitingRetap = walkSolidHoldAchieved
+                    }
+                    walkPinchWasActive = false
                     walkingGestureBeganAt = nil
                     flight?.setWalkingGestureActive(false)
-                    flight?.supportHandActive = false
+                    flight?.setRunningGestureActive(false)
+                    flight?.setSupportHandActive(false)
                 }
             }
             processToolMenuInteraction()
@@ -250,30 +292,53 @@ final class HandFlightController {
         } else if anchor.chirality == dominantHand {
             lastJoystickTrackingTime = now
             applyJoystick(pose)
+        } else if flight?.canPresentInventory == true,
+                  isSurfaceKitFistPose(pose) {
+            // Support-hand fist kit: ship, station, wreckage, landed, rover.
+            lastKitPoseMatchTime = now
+            flight?.setHandSurfaceKitActive(true)
+            flight?.updateSurfaceToolMenuPose(
+                position:
+                    pose.wrist
+                        + pose.wristToKnuckles * 0.04
+                        + pose.palmNormal * 0.05,
+                palmNormal: pose.palmNormal
+            )
         } else if flight?.isOutsideShip == true {
+            if lastKitPoseMatchTime > 0,
+               now - lastKitPoseMatchTime > 0.28 {
+                lastKitPoseMatchTime = 0
+                flight?.setHandSurfaceKitActive(false)
+            }
             handleTrackingLoss(anchor.chirality, now: now)
         } else if pose.knucklesAreUp && pose.fingersCurled {
             lastThrottleTrackingTime = now
             applyThrottle(pose)
         } else {
+            if lastKitPoseMatchTime > 0,
+               now - lastKitPoseMatchTime > 0.28 {
+                lastKitPoseMatchTime = 0
+                flight?.setHandSurfaceKitActive(false)
+            }
             handleTrackingLoss(anchor.chirality, now: now)
         }
     }
 
-    private func trackDevicePose() async {
-        while !Task.isCancelled {
-            if let anchor = worldTracking.queryDeviceAnchor(
-                atTimestamp: CACurrentMediaTime()
-            ), anchor.isTracked {
-                latestDeviceTransform = anchor.originFromAnchorTransform
-                let forward = -SIMD3<Float>(
-                    anchor.originFromAnchorTransform.columns.2.x,
-                    anchor.originFromAnchorTransform.columns.2.y,
-                    anchor.originFromAnchorTransform.columns.2.z
-                )
-                flight?.setWalkingFacingDirection(forward)
-            }
-            try? await Task.sleep(for: .milliseconds(16))
+    private func applyConfiguredHandedness() {
+        guard let flight else { return }
+        let setting = flight.dominantHandSettingForCurrentMode
+        let configured: HandAnchor.Chirality =
+            setting == .left ? .left : .right
+        if dominantHand != configured {
+            joystickNeutral = nil
+            throttleNeutralPosition = nil
+            clearJoystick()
+            releaseThrottle()
+        }
+        dominantHand = configured
+        secondaryHand = configured == .left ? .right : .left
+        if flight.dominantHandName != setting.rawValue {
+            flight.dominantHandName = setting.rawValue
         }
     }
 
@@ -321,18 +386,27 @@ final class HandFlightController {
     private func isWalkingRoleSelectionPose(
         _ pose: HandPose
     ) -> Bool {
-        isForgivingWalkingPose(pose)
+        isWalkingLocomotionPose(pose)
             && !isPalmFacingUser(pose)
-            && !(pose.allDigitsSpread
+            && !(pose.fingersOutstretched
+                && !pose.thumbMiddlePinched
                 && isBackOfHandFacingUser(pose))
+    }
+
+    /// Thumb tip touching the middle finger moves the player forward in any
+    /// hand orientation. A closed fist is never treated as walking.
+    private func isWalkingLocomotionPose(
+        _ pose: HandPose
+    ) -> Bool {
+        pose.thumbMiddlePinched
+            && !pose.fingersCurled
+            && isInWalkingActivationZone(pose.fistPosition)
     }
 
     private func isForgivingWalkingPose(
         _ pose: HandPose
     ) -> Bool {
-        pose.thumbRaisedForWalking
-            && pose.handOpenForWalking
-            && isInWalkingActivationZone(pose.fistPosition)
+        isWalkingLocomotionPose(pose)
     }
 
     private func isPalmFacingUser(_ pose: HandPose) -> Bool {
@@ -363,6 +437,45 @@ final class HandFlightController {
             -pose.palmNormal,
             simd_normalize(toHead)
         ) > 0.42
+    }
+
+    /// On-foot kit: closed fist, thumb tucked on the fist, fist face toward you.
+    /// Natural pose is palm-toward-face (you look at the curled fingers), not
+    /// punching the fist tip at your nose — the old wristToKnuckles check
+    /// rejected almost every real attempt.
+    private func isSurfaceKitFistPose(_ pose: HandPose) -> Bool {
+        // Joystick-grade `fingersCurled` is too strict for a casual fist.
+        let fistLike =
+            pose.fingersCurled
+            || (pose.grabClosed && !pose.fingersOutstretched)
+        guard fistLike,
+              !pose.thumbIsUp,
+              pose.thumbFoldRatio < 1.12,
+              let transform = latestDeviceTransform else {
+            return false
+        }
+        let headPosition = SIMD3<Float>(
+            transform.columns.3.x,
+            transform.columns.3.y,
+            transform.columns.3.z
+        )
+        let toHead = headPosition - pose.fistPosition
+        guard simd_length_squared(toHead) > 0.001 else { return false }
+        let towardUser = simd_normalize(toHead)
+        let palmTowardUser = simd_dot(pose.palmNormal, towardUser)
+        let fingersTowardUser = simd_dot(pose.wristToKnuckles, towardUser)
+        // Prefer palm-toward (see your fingers); allow knuckle-toward too.
+        return max(palmTowardUser, fingersTowardUser) > 0.34
+    }
+
+    private func expireWalkRunRetapWindow(now: Double) {
+        guard walkBreakAwaitingRetap,
+              now - lastWalkPinchReleaseTime > 0.40 else {
+            return
+        }
+        walkBreakAwaitingRetap = false
+        walkSolidHoldAchieved = false
+        runGestureLatched = false
     }
 
     private func processToolMenuInteraction() {
@@ -657,7 +770,7 @@ final class HandFlightController {
         }
 
         switch flight.selectedSurfaceTool {
-        case .sonicSlicer:
+        case .sonicSlicer, .axe:
             if surfaceToolTriggerArmed,
                thumbPressed,
                now - lastSurfaceToolImpactTime > 0.35 {
@@ -670,20 +783,29 @@ final class HandFlightController {
                 lastSurfaceToolImpactTime = now
             }
         case .matterCrumbler:
-            if surfaceToolTriggerArmed, thumbPressed {
+            // Prefer a soft in-view gate so brief aim wobble does not kill the beam.
+            let crumblerInView = isPointingForward(pose.wristToKnuckles)
+                || (surfaceToolTriggerPressed
+                    && isLooselyPointingForward(pose.wristToKnuckles))
+            if surfaceToolTriggerArmed,
+               thumbPressed,
+               crumblerInView {
                 surfaceToolTriggerPressed = true
                 let elapsed = lastMatterCrumblerUpdateTime.map {
                     max(0, min(now - $0, 0.10))
-                } ?? 0
+                } ?? (1.0 / 60.0)
                 lastMatterCrumblerUpdateTime = now
                 flight.updateMatterCrumblerBeam(
                     from: toolTip,
                     direction: pose.wristToKnuckles,
                     deltaTime: Float(elapsed)
                 )
-            } else if thumbReleased {
+            } else if thumbReleased || !crumblerInView {
                 flight.stopMatterCrumblerBeam()
                 lastMatterCrumblerUpdateTime = nil
+                if !crumblerInView {
+                    surfaceToolTriggerPressed = false
+                }
             }
         case .matterLauncher, .analyzer:
             if surfaceToolTriggerArmed, thumbPressed {
@@ -705,7 +827,7 @@ final class HandFlightController {
                         from: toolTip,
                         direction: pose.wristToKnuckles
                     )
-                case .empty, .sonicSlicer, .matterCrumbler:
+                case .empty, .axe, .sonicSlicer, .matterCrumbler:
                     break
                 }
             }
@@ -719,7 +841,19 @@ final class HandFlightController {
     private func isPointingForward(
         _ direction: SIMD3<Float>
     ) -> Bool {
-        guard let transform = latestDeviceTransform else { return false }
+        pointingAlignment(direction) > 0.42
+    }
+
+    private func isLooselyPointingForward(
+        _ direction: SIMD3<Float>
+    ) -> Bool {
+        pointingAlignment(direction) > 0.18
+    }
+
+    private func pointingAlignment(
+        _ direction: SIMD3<Float>
+    ) -> Float {
+        guard let transform = latestDeviceTransform else { return 0 }
         let headForward = simd_normalize(
             -SIMD3<Float>(
                 transform.columns.2.x,
@@ -727,10 +861,8 @@ final class HandFlightController {
                 transform.columns.2.z
             )
         )
-        return simd_dot(
-            simd_normalize(direction),
-            headForward
-        ) > 0.52
+        guard simd_length_squared(direction) > 0.000_001 else { return 0 }
+        return simd_dot(simd_normalize(direction), headForward)
     }
 
     private func resetSurfaceToolGestureState() {
@@ -769,8 +901,9 @@ final class HandFlightController {
                 forward: -pitch,
                 turn: lateral
             )
-            flight.dominantHandActive = true
-            flight.dominantHandName = dominantHand == .left ? "LEFT" : "RIGHT"
+            flight.setDominantHandActive(true)
+            flight.dominantHandName =
+                flight.dominantHandSettingForCurrentMode.rawValue
             updateStatus()
             return
         }
@@ -783,8 +916,9 @@ final class HandFlightController {
         if !flight.hasAutopilotTarget {
             flight.autopilot = false
         }
-        flight.dominantHandActive = true
-        flight.dominantHandName = dominantHand == .left ? "LEFT" : "RIGHT"
+        flight.setDominantHandActive(true)
+        flight.dominantHandName =
+            flight.dominantHandSettingForCurrentMode.rawValue
         updateStatus()
     }
 
@@ -824,7 +958,7 @@ final class HandFlightController {
         }
 
         updateHyperDriveButton(thumbFoldRatio: pose.thumbFoldRatio)
-        flight.supportHandActive = true
+        flight.setSupportHandActive(true)
         updateStatus()
     }
 
@@ -884,18 +1018,28 @@ final class HandFlightController {
            chirality != dominantHand {
             guard now - lastWalkingTrackingTime > 0.35 else { return }
             walkingGestureBeganAt = nil
+            walkPinchWasActive = false
+            walkSolidHoldAchieved = false
+            walkBreakAwaitingRetap = false
+            runGestureLatched = false
+            lastKitPoseMatchTime = 0
             flight?.setWalkingGestureActive(false)
-            flight?.setSurfaceToolMenuVisible(false)
-            flight?.setInventoryVisible(false)
-            flight?.supportHandActive = false
+            flight?.setRunningGestureActive(false)
+            flight?.controllerSurfaceKitLatched = false
+            flight?.handSurfaceKitActive = false
+            flight?.setSurfaceKitVisible(false)
+            flight?.setSupportHandActive(false)
             updateStatus()
             return
         }
         if chirality == dominantHand {
-            if flight?.activeExplorationMode == "Leave on foot",
-               flight?.selectedSurfaceTool == .matterCrumbler,
-               surfaceToolTriggerPressed {
-                flight?.setMatterCrumblerTrackingHold(true)
+            endSeatedViewYawPinch()
+            if flight?.activeExplorationMode == "Leave on foot" {
+                flight?.setJetpackThrusting(false)
+                if flight?.selectedSurfaceTool == .matterCrumbler,
+                   surfaceToolTriggerPressed {
+                    flight?.setMatterCrumblerTrackingHold(true)
+                }
             }
             guard now - lastJoystickTrackingTime > 0.22 else { return }
             joystickNeutral = nil
@@ -916,33 +1060,40 @@ final class HandFlightController {
         guard mode != lastExplorationMode else { return }
 
         lastExplorationMode = mode
-        if mode == "Leave on foot" {
-            dominantHand = nil
-            secondaryHand = nil
-            flight.dominantHandName = "—"
-        } else {
-            secondaryHand = nil
-        }
+        applyConfiguredHandedness()
         joystickNeutral = nil
         throttleNeutralPosition = nil
         walkingGestureBeganAt = nil
         lastWalkingPoseMatchTime = 0
+        walkPinchWasActive = false
+        walkSolidHoldAchieved = false
+        walkBreakAwaitingRetap = false
+        lastWalkPinchReleaseTime = 0
+        runGestureLatched = false
+        lastKitPoseMatchTime = 0
         toolMenuTouchActive = false
         toolMenuTouchStartX = nil
         collectionGestureActive = false
         collectionGestureArmed = false
+        endSeatedViewYawPinch()
         resetActivationGesture()
         resetSurfaceToolGestureState()
         resetEatingGesture()
         flight.setWalkingGestureActive(false)
-        flight.setSurfaceToolMenuVisible(false)
-        flight.setInventoryVisible(false)
+        flight.setRunningGestureActive(false)
+        flight.setJetpackThrusting(false)
+        flight.resetWalkingLocomotionBoosts()
+        if !flight.isSettingsMenuPresented {
+            flight.controllerSurfaceKitLatched = false
+            flight.handSurfaceKitActive = false
+            flight.setSurfaceKitVisible(false)
+        }
         flight.setHeldSurfaceToolVisible(
             mode == "Leave on foot"
         )
         flight.setExplorationControls(forward: 0, turn: 0)
-        flight.dominantHandActive = false
-        flight.supportHandActive = false
+        flight.setDominantHandActive(false)
+        flight.setSupportHandActive(false)
         flight.releaseJoystickVisual()
         flight.releaseThrottleVisual()
     }
@@ -954,8 +1105,76 @@ final class HandFlightController {
         flight?.setExplorationControls(forward: 0, turn: 0)
         dominantTriggerPressed = false
         flight?.setWeaponTrigger(false)
-        flight?.dominantHandActive = false
+        flight?.setDominantHandActive(false)
         flight?.releaseJoystickVisual()
+    }
+
+    private func isSeatedViewYawPinchPose(_ pose: HandPose) -> Bool {
+        // Hysteresis while dragging so a slightly looser pinch still holds.
+        let pinchSpanLimit: Float = seatedYawPinchActive ? 0.58 : 0.48
+        return pose.thumbIndexSpan < pinchSpanLimit
+            && !pose.fingersCurled
+            && !pose.thumbMiddlePinched
+    }
+
+    /// Dominant thumb↔index pinch-drag yaws forward/compass; release keeps it.
+    @discardableResult
+    private func processSeatedViewYawPinch(_ pose: HandPose) -> Bool {
+        guard let flight else { return false }
+        guard isSeatedViewYawPinchPose(pose) else {
+            if seatedYawPinchActive {
+                endSeatedViewYawPinch()
+                updateStatus()
+            }
+            return false
+        }
+
+        let handPosition = pose.indexTip
+        if !seatedYawPinchActive {
+            seatedYawPinchActive = true
+            seatedYawLastHandPosition = handPosition
+            joystickNeutral = nil
+            clearJoystick()
+            flight.setJetpackThrusting(false)
+            flight.stopMatterCrumblerBeam()
+            lastMatterCrumblerUpdateTime = nil
+            surfaceToolTriggerPressed = false
+            flight.setHandTrackingStatus("Pinch-drag to turn view")
+            return true
+        }
+
+        guard let lastPosition = seatedYawLastHandPosition else {
+            seatedYawLastHandPosition = handPosition
+            return true
+        }
+        let delta = handPosition - lastPosition
+        seatedYawLastHandPosition = handPosition
+
+        let headRight: SIMD3<Float>
+        if let transform = latestDeviceTransform {
+            headRight = simd_normalize(
+                SIMD3<Float>(
+                    transform.columns.0.x,
+                    transform.columns.0.y,
+                    transform.columns.0.z
+                )
+            )
+        } else {
+            headRight = SIMD3<Float>(1, 0, 0)
+        }
+        // Drag content with the hand: move right → world follows right (~2.6 rad / m).
+        let lateral = simd_dot(delta, headRight)
+        let yawRadians = -lateral * 2.6
+        if abs(yawRadians) > 0.000_15 {
+            flight.applySeatedViewYaw(yawRadians)
+        }
+        flight.setHandTrackingStatus("Pinch-drag to turn view")
+        return true
+    }
+
+    private func endSeatedViewYawPinch() {
+        seatedYawPinchActive = false
+        seatedYawLastHandPosition = nil
     }
 
     private func releaseThrottle() {
@@ -963,40 +1182,59 @@ final class HandFlightController {
         flight.throttle = Double(flight.speed / flight.maximumForwardSpeed)
         hyperDrivePressStartedAt = nil
         flight.cancelHyperDriveCharge()
-        flight.supportHandActive = false
+        flight.setSupportHandActive(false)
         flight.releaseThrottleVisual()
     }
 
     private func updateStatus() {
         guard let flight else { return }
-        if flight.isSurfaceExploration {
+        let status: String
+        if flight.isPaused {
+            status = "Paused • Settings"
+        } else if seatedYawPinchActive {
+            status = "Pinch-drag to turn view"
+        } else if flight.isSurfaceExploration {
             if flight.activeExplorationMode == "Leave on foot",
-               secondaryHand == nil {
-                flight.handTrackingStatus =
-                    "Show the walking pose with either hand"
+                      flight.isSurfaceKitVisible {
+                status = flight.walkingGestureActive
+                    ? "Kit open • walking"
+                    : "Kit open • fist toward you, thumb on fist"
+            } else if flight.activeExplorationMode == "Leave on foot",
+                      flight.walkingGestureActive {
+                if flight.isJetpackThrusting {
+                    status = flight.isRunningGestureActive
+                        ? "Running + jetpack"
+                        : "Walking + jetpack"
+                } else if flight.isRunningGestureActive {
+                    status = "Running • hold walk, release, hold again"
+                } else {
+                    status = "Walking • release+hold thumb↔middle to run"
+                }
+            } else if flight.activeExplorationMode == "Leave on foot" {
+                status =
+                    "Thumb↔middle = walk/run • fist to face + thumb tucked = kit • dominant pinch = turn"
             } else {
-                flight.handTrackingStatus =
+                status =
                     flight.activeExplorationMode == "Deploy rover"
-                    ? "Rover steering active"
-                    : (flight.walkingGestureActive
-                        ? "Walking toward view direction"
-                        : "Extend secondary hand to walk")
+                    ? "Rover steering • dominant pinch turns view"
+                    : "Surface controls • dominant pinch turns view"
             }
         } else if flight.isAtmosphericBoostHeld
-                    || flight.atmosphericBoostBlend > 0.01 {
-            flight.handTrackingStatus = "Atmospheric boost active — release to ramp down"
+                    || flight.isAtmosphericBoostActive {
+            status = "Atmospheric boost active — release to ramp down"
         } else if flight.isBoosting {
-            flight.handTrackingStatus = "Hyper speed active — unlimited fuel"
+            status = "Hyper speed active — unlimited fuel"
         } else if flight.isHyperDriveCharging {
-            flight.handTrackingStatus =
+            status =
                 "Hyper speed in \(Int(ceil(flight.hyperDriveCountdown)))"
         } else if flight.dominantHandActive && flight.supportHandActive {
-            flight.handTrackingStatus = "Joystick + throttle active"
+            status = "Joystick + throttle active"
         } else if flight.dominantHandActive {
-            flight.handTrackingStatus = "Joystick active"
+            status = "Joystick active"
         } else {
-            flight.handTrackingStatus = "Grip joystick with thumb up"
+            status = "Grip joystick with thumb up • pinch-drag turns view"
         }
+        flight.setHandTrackingStatus(status)
     }
 
     private func pose(for anchor: HandAnchor) -> HandPose? {
@@ -1121,6 +1359,11 @@ final class HandFlightController {
                 && fingerExtensionRatios[1...3]
                     .filter { $0 < 1.32 }.count >= 2
         let thumbIndexPinched = thumbIndexSpan < 0.48
+        let middleTip = fingerTipPositions[1]
+        let thumbMiddleSpan =
+            simd_distance(thumbTip, middleTip) / palmWidth
+        // Any orientation: thumb pad to middle finger tip/shaft counts as walk.
+        let thumbMiddlePinched = thumbMiddleSpan < 0.52
         let grabClosed =
             thumbIndexPinched || fingersCurled
 
@@ -1142,7 +1385,9 @@ final class HandFlightController {
             indexExtended: fingerExtensionRatios[0] > 1.05,
             isCShape: isCShape,
             grabClosed: grabClosed,
-            thumbIndexPinched: thumbIndexPinched
+            thumbIndexSpan: thumbIndexSpan,
+            thumbIndexPinched: thumbIndexPinched,
+            thumbMiddlePinched: thumbMiddlePinched
         )
     }
 
@@ -1194,5 +1439,7 @@ private struct HandPose {
     let indexExtended: Bool
     let isCShape: Bool
     let grabClosed: Bool
+    let thumbIndexSpan: Float
     let thumbIndexPinched: Bool
+    let thumbMiddlePinched: Bool
 }

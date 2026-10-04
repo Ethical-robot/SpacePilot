@@ -28,4 +28,6 @@ Planet surfaces use deterministic type-specific biomes: ocean worlds include rai
 
 After landing, choose **Deploy rover** or **Leave on foot**. The dominant fist becomes a surface controller: tilt forward or backward to move and left or right to steer. The rover travels at a medium 11 m/s maximum while on-foot movement is limited to 2.6 m/s. Both modes follow the curved surface and display a dedicated speed and heading HUD.
 
+See [CONTROLS.md](CONTROLS.md) for the full living list of hand gestures, gamepad bindings, and HUD/window controls (update that file whenever controls change).
+
 See [TASKS.md](TASKS.md) for the long-term gameplay and production roadmap.

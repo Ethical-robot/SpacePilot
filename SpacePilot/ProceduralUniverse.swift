@@ -9,6 +9,11 @@ struct SurfacePickup {
         case mineral
         case electronic
         case creatureMaterial
+        case relic
+        case relicKey
+        case element
+        case blueprint
+        case module
     }
 
     let materialName: String
@@ -16,6 +21,9 @@ struct SurfacePickup {
     let sourcePlanetIdentifier: String
     let sourcePlanetName: String
     let sourcePlanetKind: CelestialBodyKind
+    var relicCanOpen: Bool = false
+    var moduleID: String? = nil
+    var blueprintID: String? = nil
 }
 
 enum UniverseScale {
@@ -29,11 +37,11 @@ enum UniverseScale {
     static let surfaceEyeHeight: Float = 1
 
     static func upperAtmosphereDepth(for radius: Float) -> Float {
-        max(radius * 3, 700)
+        ScaleAndSpeedContract.upperAtmosphereDepth(for: radius)
     }
 
     static func lowerAtmosphereDepth(for radius: Float) -> Float {
-        radius * 0.32
+        ScaleAndSpeedContract.lowerAtmosphereDepth(for: radius)
     }
 }
 
@@ -134,6 +142,28 @@ struct PointOfInterestDescriptor: Sendable {
     let kind: PointOfInterestKind
     let localPosition: SIMD3<Double>
     let orientation: SIMD3<Float>
+    /// Host planet this station orbits / specializes for (stations only).
+    let hostPlanetName: String?
+    let hostPlanetKind: CelestialBodyKind?
+    let specialtyFamily: StationMaterialFamily?
+
+    init(
+        name: String,
+        kind: PointOfInterestKind,
+        localPosition: SIMD3<Double>,
+        orientation: SIMD3<Float>,
+        hostPlanetName: String? = nil,
+        hostPlanetKind: CelestialBodyKind? = nil,
+        specialtyFamily: StationMaterialFamily? = nil
+    ) {
+        self.name = name
+        self.kind = kind
+        self.localPosition = localPosition
+        self.orientation = orientation
+        self.hostPlanetName = hostPlanetName
+        self.hostPlanetKind = hostPlanetKind
+        self.specialtyFamily = specialtyFamily
+    }
 }
 
 struct ProceduralRegion: Sendable {
@@ -152,39 +182,41 @@ struct ProceduralUniverseGenerator: Sendable {
         }
 
         var random = UniverseRandom(seed: seed(for: sector))
-        let bodyCount = random.int(in: 1...3)
-        var bodies: [CelestialBodyDescriptor] = []
-        bodies.reserveCapacity(bodyCount)
-
-        let syllables = ["Astra", "Cinder", "Eos", "Khepri", "Nysa", "Orion", "Rhea", "Vela", "Zephyr"]
+        let planetCount = random.int(
+            in: ScaleAndSpeedContract.minPlanetsPerSystem
+                ... ScaleAndSpeedContract.maxPlanetsPerSystem
+        )
+        let syllables = [
+            "Astra", "Cinder", "Eos", "Khepri", "Nysa",
+            "Orion", "Rhea", "Vela", "Zephyr", "Helios"
+        ]
         let suffixes = ["I", "II", "III", "Prime", "Minor", "Haven", "Reach"]
+        let starName =
+            "\(syllables[random.int(in: 0...(syllables.count - 1))]) Primary"
 
-        for index in 0..<bodyCount {
-            let isStar = index == 0 && random.chance(0.22)
-            let kind: CelestialBodyKind = isStar
-                ? .star
-                : [.ocean, .desert, .rocky, .ice, .gas][random.int(in: 0...4)]
-            let baseRadius: Float = isStar
-                ? random.float(in: 4.5...8.5)
-                : random.float(in: 1.4...5.8)
+        var planets: [CelestialBodyDescriptor] = []
+        planets.reserveCapacity(planetCount)
+        for _ in 0..<planetCount {
+            let kind: CelestialBodyKind =
+                [.ocean, .desert, .rocky, .ice, .gas][random.int(in: 0...4)]
+            let baseRadius = random.float(in: 1.4...5.8)
             let radius = baseRadius * UniverseScale.celestialBody
-            let name = "\(syllables[random.int(in: 0...(syllables.count - 1))]) \(suffixes[random.int(in: 0...(suffixes.count - 1))])"
-            let position = spacedBodyPosition(existing: bodies, random: &random)
+            let name =
+                "\(syllables[random.int(in: 0...(syllables.count - 1))]) "
+                + "\(suffixes[random.int(in: 0...(suffixes.count - 1))])"
             let hasAtmosphere: Bool = switch kind {
-            case .star:
-                false
-            case .ocean:
-                random.chance(0.92)
-            case .desert:
-                random.chance(0.68)
-            case .rocky:
-                random.chance(0.34)
-            case .ice:
-                random.chance(0.52)
-            case .gas:
-                true
+            case .star: false
+            case .ocean: random.chance(0.92)
+            case .desert: random.chance(0.68)
+            case .rocky: false
+            case .ice: random.chance(0.52)
+            case .gas: true
             }
-            bodies.append(
+            let position = spacedPlanetPosition(
+                existing: planets,
+                random: &random
+            )
+            planets.append(
                 CelestialBodyDescriptor(
                     name: name,
                     kind: kind,
@@ -196,45 +228,125 @@ struct ProceduralUniverseGenerator: Sendable {
             )
         }
 
-        let stars = (0..<12).map { _ in
+        let largestPlanetRadius =
+            planets.map(\.radius).max() ?? (3 * UniverseScale.celestialBody)
+        let starMultiplier = random.chance(
+            Double(ScaleAndSpeedContract.largeStarChance)
+        )
+            ? ScaleAndSpeedContract.largeStarVsLargestPlanet
+            : ScaleAndSpeedContract.smallStarVsLargestPlanet
+        // Keep sector origin near the first planet, not inside the star.
+        let originShift = planets.first.map { -$0.localPosition } ?? .zero
+        let shiftedPlanets = planets.map { planet in
+            CelestialBodyDescriptor(
+                name: planet.name,
+                kind: planet.kind,
+                radius: planet.radius,
+                localPosition: planet.localPosition + originShift,
+                hasRings: planet.hasRings,
+                hasAtmosphere: planet.hasAtmosphere
+            )
+        }
+        let star = CelestialBodyDescriptor(
+            name: starName,
+            kind: .star,
+            radius: largestPlanetRadius * starMultiplier,
+            localPosition: originShift,
+            hasRings: false,
+            hasAtmosphere: false
+        )
+        let bodies = [star] + shiftedPlanets
+
+        let backgroundStars = (0..<12).map { _ in
             SIMD3<Float>(
                 random.float(in: -5_800...5_800) * UniverseScale.distance,
                 random.float(in: -5_800...5_800) * UniverseScale.distance,
                 random.float(in: -5_800...5_800) * UniverseScale.distance
             )
         }
-        let pointsOfInterest = makePointsOfInterest(
-            near: bodies,
+        let pointsOfInterest = makeSolarSystemPointsOfInterest(
+            planets: shiftedPlanets,
+            star: star,
             random: &random
         )
         return ProceduralRegion(
             sector: sector,
             bodies: bodies,
             pointsOfInterest: pointsOfInterest,
-            stars: stars
+            stars: backgroundStars
         )
     }
 
-    private func makePointsOfInterest(
-        near bodies: [CelestialBodyDescriptor],
+    private func makeSolarSystemPointsOfInterest(
+        planets: [CelestialBodyDescriptor],
+        star: CelestialBodyDescriptor,
         random: inout UniverseRandom
     ) -> [PointOfInterestDescriptor] {
-        let count = random.chance(0.68) ? 1 : 2
+        let stationNames = [
+            "Wayfarer Exchange", "Farpoint Relay",
+            "Helios Anchorage", "Frontier Depot",
+            "Orbital Market", "Ringward Depot"
+        ]
+        let wreckageNames = [
+            "Silent Convoy", "Broken Spear",
+            "Lost Surveyor", "Drifting Ark"
+        ]
         var points: [PointOfInterestDescriptor] = []
-        let stationNames = ["Wayfarer Exchange", "Farpoint Relay", "Helios Anchorage", "Frontier Depot"]
-        let wreckageNames = ["Silent Convoy", "Broken Spear", "Lost Surveyor", "Drifting Ark"]
+        var hostPlanets = planets
+        // Deterministic Fisher–Yates shuffle.
+        if hostPlanets.count > 1 {
+            for i in stride(from: hostPlanets.count - 1, through: 1, by: -1) {
+                let j = random.int(in: 0...i)
+                hostPlanets.swapAt(i, j)
+            }
+        }
+        let stationCount = min(
+            hostPlanets.count,
+            max(
+                ScaleAndSpeedContract.minStationsPerSystem,
+                random.int(
+                    in: ScaleAndSpeedContract.minStationsPerSystem
+                        ... min(hostPlanets.count, 4)
+                )
+            )
+        )
 
-        for _ in 0..<count {
-            let kind: PointOfInterestKind = random.chance(0.42) ? .station : .wreckage
-            let names = kind == .station ? stationNames : wreckageNames
+        for index in 0..<stationCount {
+            let host = hostPlanets[index]
+            let specialty = StationMaterialFamily.specializing(in: host.kind)
             points.append(
                 PointOfInterestDescriptor(
-                    name: names[random.int(in: 0...(names.count - 1))],
-                    kind: kind,
-                    localPosition: spacedPointOfInterestPosition(
-                        bodies: bodies,
+                    name: stationNames[
+                        random.int(in: 0...(stationNames.count - 1))
+                    ],
+                    kind: .station,
+                    localPosition: stationOrbitPosition(
+                        around: host,
+                        random: &random
+                    ),
+                    orientation: SIMD3<Float>(
+                        random.float(in: -.pi ... .pi),
+                        random.float(in: -.pi ... .pi),
+                        random.float(in: -.pi ... .pi)
+                    ),
+                    hostPlanetName: host.name,
+                    hostPlanetKind: host.kind,
+                    specialtyFamily: specialty
+                )
+            )
+        }
+
+        let wreckageCount = random.chance(0.55) ? 1 : 0
+        for _ in 0..<wreckageCount {
+            points.append(
+                PointOfInterestDescriptor(
+                    name: wreckageNames[
+                        random.int(in: 0...(wreckageNames.count - 1))
+                    ],
+                    kind: .wreckage,
+                    localPosition: spacedWreckagePosition(
+                        bodies: [star] + planets,
                         existing: points,
-                        kind: kind,
                         random: &random
                     ),
                     orientation: SIMD3<Float>(
@@ -248,73 +360,64 @@ struct ProceduralUniverseGenerator: Sendable {
         return points
     }
 
-    private func spacedPointOfInterestPosition(
-        bodies: [CelestialBodyDescriptor],
-        existing points: [PointOfInterestDescriptor],
-        kind: PointOfInterestKind,
+    private func stationOrbitPosition(
+        around host: CelestialBodyDescriptor,
         random: inout UniverseRandom
     ) -> SIMD3<Double> {
-        let distanceScale = Double(UniverseScale.distance)
-        let candidateRadius = Double(
-            kind == .station
-                ? UniverseScale.stationRadius
-                : UniverseScale.wreckageRadius
-        )
+        let orbit =
+            Double(host.radius)
+            + Double(ScaleAndSpeedContract.typicalStationOrbitDistance)
+            * random.double(in: 0.85...1.15)
+        let direction = random.unitVectorDouble()
+        return host.localPosition + direction * orbit
+    }
+
+    private func spacedWreckagePosition(
+        bodies: [CelestialBodyDescriptor],
+        existing points: [PointOfInterestDescriptor],
+        random: inout UniverseRandom
+    ) -> SIMD3<Double> {
+        let spacing = Double(ScaleAndSpeedContract.typicalPlanetSpacing) * 0.35
+        let candidateRadius = Double(UniverseScale.wreckageRadius)
         var candidate = SIMD3<Double>.zero
         for _ in 0..<48 {
-            candidate = SIMD3<Double>(
-                random.double(in: -4_200...4_200) * distanceScale,
-                random.double(in: -2_500...2_500) * distanceScale,
-                random.double(in: -4_200...4_200) * distanceScale
-            )
+            candidate = random.unitVectorDouble()
+                * random.double(in: spacing * 0.4...spacing * 1.6)
             let clearOfBodies = bodies.allSatisfy {
                 simd_distance(candidate, $0.localPosition)
-                    >= max(
-                        Double($0.radius) + candidateRadius + 200,
-                        1_000 * distanceScale
-                    )
+                    >= Double($0.radius) + candidateRadius
+                    + Double(ScaleAndSpeedContract.typicalStationOrbitDistance)
+                        * 0.25
             }
             let clearOfOtherPoints = points.allSatisfy {
-                let existingRadius = Double(
-                    $0.kind == .station
-                        ? UniverseScale.stationRadius
-                        : UniverseScale.wreckageRadius
-                )
-                return simd_distance(candidate, $0.localPosition)
-                    >= max(
-                        candidateRadius + existingRadius + 300,
-                        1_400 * distanceScale
-                    )
+                simd_distance(candidate, $0.localPosition)
+                    >= candidateRadius + Double(UniverseScale.stationRadius)
+                    + 800
             }
-            if simd_length(candidate) >= 600 * distanceScale,
-               clearOfBodies,
-               clearOfOtherPoints {
+            if clearOfBodies, clearOfOtherPoints {
                 return candidate
             }
         }
         return candidate
     }
 
-    private func spacedBodyPosition(
-        existing bodies: [CelestialBodyDescriptor],
+    private func spacedPlanetPosition(
+        existing planets: [CelestialBodyDescriptor],
         random: inout UniverseRandom
     ) -> SIMD3<Double> {
-        let distanceScale = Double(UniverseScale.distance)
-        let minimumBodySpacing = 2_600.0 * distanceScale
-        let clearCenterRadius = 1_800.0 * distanceScale
+        let spacing = Double(ScaleAndSpeedContract.typicalPlanetSpacing)
+        let ringIndex = Double(planets.count + 1)
         var candidate = SIMD3<Double>.zero
-
-        for _ in 0..<48 {
-            candidate = SIMD3<Double>(
-                random.double(in: -4_500...4_500) * distanceScale,
-                random.double(in: -3_000...3_000) * distanceScale,
-                random.double(in: -4_500...4_500) * distanceScale
-            )
-            let clearsSectorCenter = simd_length(candidate) >= clearCenterRadius
-            let clearsOtherBodies = bodies.allSatisfy {
-                simd_distance(candidate, $0.localPosition) >= minimumBodySpacing
+        for _ in 0..<64 {
+            let radius = spacing * ringIndex * random.double(in: 0.85...1.15)
+            candidate = random.unitVectorDouble() * radius
+            // Keep planets mostly in a flattened system plane.
+            candidate.y *= 0.18
+            let clearsStar = simd_length(candidate) >= spacing * 0.55
+            let clearsOthers = planets.allSatisfy {
+                simd_distance(candidate, $0.localPosition) >= spacing * 0.75
             }
-            if clearsSectorCenter && clearsOtherBodies {
+            if clearsStar, clearsOthers {
                 return candidate
             }
         }
@@ -322,31 +425,122 @@ struct ProceduralUniverseGenerator: Sendable {
     }
 
     private func startingRegion() -> ProceduralRegion {
-        let distanceScale = Double(UniverseScale.distance)
-        let bodies = [
-            CelestialBodyDescriptor(name: "Sun", kind: .star, radius: 5.5 * UniverseScale.celestialBody, localPosition: SIMD3<Double>(-3_000, 1_600, -5_200) * distanceScale, hasRings: false, hasAtmosphere: false),
-            CelestialBodyDescriptor(name: "Earth", kind: .ocean, radius: 3.2 * UniverseScale.celestialBody, localPosition: SIMD3<Double>(1_800, -250, -3_500) * distanceScale, hasRings: false, hasAtmosphere: true),
-            CelestialBodyDescriptor(name: "Moon", kind: .rocky, radius: 1.35 * UniverseScale.celestialBody, localPosition: SIMD3<Double>(4_300, 500, -4_600) * distanceScale, hasRings: false, hasAtmosphere: false),
-            CelestialBodyDescriptor(name: "Mars", kind: .desert, radius: 2.5 * UniverseScale.celestialBody, localPosition: SIMD3<Double>(-4_500, -900, -2_300) * distanceScale, hasRings: false, hasAtmosphere: true),
-            CelestialBodyDescriptor(name: "Saturn", kind: .gas, radius: 4.8 * UniverseScale.celestialBody, localPosition: SIMD3<Double>(3_800, 1_200, 4_200) * distanceScale, hasRings: true, hasAtmosphere: true)
-        ]
+        let spacing = Double(ScaleAndSpeedContract.typicalPlanetSpacing)
+        let stationOrbit =
+            Double(ScaleAndSpeedContract.typicalStationOrbitDistance)
+        // Build heliocentric positions first, then shift so Earth sits at
+        // galactic / sector origin (safe default spawn neighborhood).
+        let earthFromSun = SIMD3<Double>(spacing, 0, 0)
+        let moonFromSun = SIMD3<Double>(
+            spacing + stationOrbit * 0.55,
+            spacing * 0.04,
+            -spacing * 0.08
+        )
+        let marsFromSun = SIMD3<Double>(
+            -spacing * 0.15,
+            spacing * 0.05,
+            spacing
+        )
+        let saturnFromSun = SIMD3<Double>(
+            -spacing * 0.2,
+            -spacing * 0.06,
+            -spacing * 1.05
+        )
+        let originShift = -earthFromSun
+
+        let earth = CelestialBodyDescriptor(
+            name: "Earth",
+            kind: .ocean,
+            radius: 3.2 * UniverseScale.celestialBody,
+            localPosition: .zero,
+            hasRings: false,
+            hasAtmosphere: true
+        )
+        let moon = CelestialBodyDescriptor(
+            name: "Moon",
+            kind: .rocky,
+            radius: 1.35 * UniverseScale.celestialBody,
+            localPosition: moonFromSun + originShift,
+            hasRings: false,
+            hasAtmosphere: false
+        )
+        let mars = CelestialBodyDescriptor(
+            name: "Mars",
+            kind: .desert,
+            radius: 2.5 * UniverseScale.celestialBody,
+            localPosition: marsFromSun + originShift,
+            hasRings: false,
+            hasAtmosphere: true
+        )
+        let saturn = CelestialBodyDescriptor(
+            name: "Saturn",
+            kind: .gas,
+            radius: 4.8 * UniverseScale.celestialBody,
+            localPosition: saturnFromSun + originShift,
+            hasRings: true,
+            hasAtmosphere: true
+        )
+        let planets = [earth, moon, mars, saturn]
+        let largest = planets.map(\.radius).max() ?? saturn.radius
+        let sun = CelestialBodyDescriptor(
+            name: "Sun",
+            kind: .star,
+            radius: largest * ScaleAndSpeedContract.smallStarVsLargestPlanet,
+            localPosition: originShift,
+            hasRings: false,
+            hasAtmosphere: false
+        )
+        let bodies = [sun] + planets
+
         var random = UniverseRandom(seed: universeSeed ^ 0x5A17_F13D)
         let stars = (0..<96).map { _ in
             random.unitVector()
                 * random.float(in: 800...5_800)
                 * UniverseScale.distance
         }
-        let pointsOfInterest = [
-            PointOfInterestDescriptor(
-                name: "Wayfarer Exchange",
+
+        func station(
+            named name: String,
+            host: CelestialBodyDescriptor,
+            offset: SIMD3<Double>
+        ) -> PointOfInterestDescriptor {
+            let direction = simd_normalize(offset)
+            let position =
+                host.localPosition
+                + direction
+                * (Double(host.radius) + stationOrbit)
+            return PointOfInterestDescriptor(
+                name: name,
                 kind: .station,
-                localPosition: SIMD3<Double>(-1_150, 320, 1_300) * distanceScale,
-                orientation: [0.15, -0.5, 0.08]
+                localPosition: position,
+                orientation: [0.15, -0.5, 0.08],
+                hostPlanetName: host.name,
+                hostPlanetKind: host.kind,
+                specialtyFamily: StationMaterialFamily.specializing(
+                    in: host.kind
+                )
+            )
+        }
+
+        let pointsOfInterest = [
+            station(
+                named: "Wayfarer Exchange",
+                host: earth,
+                offset: SIMD3<Double>(0.2, 0.4, 0.9)
+            ),
+            station(
+                named: "Helios Anchorage",
+                host: mars,
+                offset: SIMD3<Double>(-0.7, 0.2, 0.35)
             ),
             PointOfInterestDescriptor(
                 name: "Lost Surveyor",
                 kind: .wreckage,
-                localPosition: SIMD3<Double>(980, -180, -1_250) * distanceScale,
+                localPosition: SIMD3<Double>(
+                    stationOrbit * 0.45,
+                    stationOrbit * 0.08,
+                    -stationOrbit * 0.35
+                ),
                 orientation: [-0.4, 0.7, 0.3]
             )
         ]
@@ -356,6 +550,30 @@ struct ProceduralUniverseGenerator: Sendable {
             pointsOfInterest: pointsOfInterest,
             stars: stars
         )
+    }
+
+    /// Safe default spawn: Wayfarer Exchange, docked near Earth.
+    func startingStation() -> PointOfInterestDescriptor {
+        let region = startingRegion()
+        if let station = region.pointsOfInterest.first(where: {
+            $0.kind == .station && $0.name == "Wayfarer Exchange"
+        }) {
+            return station
+        }
+        return region.pointsOfInterest.first(where: { $0.kind == .station })
+            ?? PointOfInterestDescriptor(
+                name: "Wayfarer Exchange",
+                kind: .station,
+                localPosition: SIMD3<Double>(
+                    Double(ScaleAndSpeedContract.typicalPlanetSpacing),
+                    0,
+                    Double(ScaleAndSpeedContract.typicalStationOrbitDistance)
+                ),
+                orientation: [0.15, -0.5, 0.08],
+                hostPlanetName: "Earth",
+                hostPlanetKind: .ocean,
+                specialtyFamily: .softOrganics
+            )
     }
 
     private func seed(for sector: GalacticSector) -> UInt64 {
@@ -400,6 +618,40 @@ struct NearbyNavigationTarget: Sendable {
     let radius: Float
     let celestialKind: CelestialBodyKind?
     let hasAtmosphere: Bool
+    /// Station host planet (for specialty pricing).
+    let hostPlanetName: String?
+    let hostPlanetKind: CelestialBodyKind?
+    let specialtyFamily: StationMaterialFamily?
+    /// Solar system identity = containing galactic sector.
+    let systemSector: GalacticSector?
+
+    init(
+        identifier: String,
+        name: String,
+        kind: NavigationTargetKind,
+        vector: SIMD3<Float>,
+        distance: Float,
+        radius: Float,
+        celestialKind: CelestialBodyKind?,
+        hasAtmosphere: Bool,
+        hostPlanetName: String? = nil,
+        hostPlanetKind: CelestialBodyKind? = nil,
+        specialtyFamily: StationMaterialFamily? = nil,
+        systemSector: GalacticSector? = nil
+    ) {
+        self.identifier = identifier
+        self.name = name
+        self.kind = kind
+        self.vector = vector
+        self.distance = distance
+        self.radius = radius
+        self.celestialKind = celestialKind
+        self.hasAtmosphere = hasAtmosphere
+        self.hostPlanetName = hostPlanetName
+        self.hostPlanetKind = hostPlanetKind
+        self.specialtyFamily = specialtyFamily
+        self.systemSector = systemSector
+    }
 }
 
 private struct UniverseDiscoverySnapshot: Codable {
@@ -571,14 +823,58 @@ final class UniverseStreamer {
 
     private struct CreatureObstacle {
         let identifier: String
-        let center: SIMD2<Double>
+        var center: SIMD2<Double>
         let radius: Double
         let height: Double
+        var tileCoordinate: SurfaceTileCoordinate?
+        var entity: Entity?
+    }
+
+    private struct TrackedCreature {
+        let entity: Entity
+        let tileCoordinate: SurfaceTileCoordinate
+        let stateKey: String
+        let isAggressive: Bool
+        let homeX: Float
+        let homeZ: Float
+        let baseHeading: Float
+        let moveSpeed: Float
+        let phase: Float
+        let isWinged: Bool
+        var hitFlash: Entity?
+        var bodyEntity: Entity?
+    }
+
+    private struct TrackedRobot {
+        let entity: Entity
+        let tileCoordinate: SurfaceTileCoordinate
+        let homeTileX: Float
+        let homeTileZ: Float
     }
 
     private struct SurfaceTileCoordinate: Hashable {
         let x: Int
         let z: Int
+    }
+
+    private struct DestinationRef {
+        enum Target {
+            case body(index: Int)
+            case point(index: Int)
+        }
+
+        let sector: GalacticSector
+        let target: Target
+    }
+
+    private struct BodyEntityRef {
+        let sector: GalacticSector
+        let bodyIndex: Int
+        let body: CelestialBodyDescriptor
+        let entity: Entity
+        let upperAtmosphereDetail: Entity?
+        let lowerAtmosphereDetail: Entity?
+        let groundDetail: Entity?
     }
 
     private struct SurfaceExplorationState {
@@ -598,16 +894,27 @@ final class UniverseStreamer {
         let biomeHalfDepth: Float
         var loadedTiles: [SurfaceTileCoordinate: Entity]
         var resourceHealth: [ObjectIdentifier: Float]
+        /// Surface resource IDs marked by the Analyzer (+33% yield / Relic confirm).
+        var scannedResourceIDs: Set<String>
         var creatureStates: [String: CreatureRuntimeState]
         var wildlifeAnimationTime: Float
         var pendingCreatureHits: Int
         var pendingCreatureKnockback: SIMD3<Float>
+        var trackedCreatures: [TrackedCreature] = []
+        var trackedRobots: [TrackedRobot] = []
+        var cachedObstacles: [CreatureObstacle] = []
+        var healthBarEntities: [Entity] = []
+        var pendingTileCoordinates: [SurfaceTileCoordinate] = []
+        var shipObstacleIdentifier: String?
+        var roverObstacleIdentifier: String?
     }
 
     private let root: Entity
     private let generator: ProceduralUniverseGenerator
     private let planetaryScans = PlanetaryScanStore()
     private var loadedRegions: [GalacticSector: (descriptor: ProceduralRegion, entity: Entity)] = [:]
+    private var destinationRefs: [String: DestinationRef] = [:]
+    private var bodyEntityRefs: [String: BodyEntityRef] = [:]
     private var regionChildSimulationPositions:
         [ObjectIdentifier: SIMD3<Double>] = [:]
     private var renderOrigin: GalacticPosition?
@@ -617,7 +924,11 @@ final class UniverseStreamer {
     private let discoveries = UniverseDiscoveryStore()
     private let surfaceResources = SurfaceResourceStore()
     private let streamingRadius: Int64 = 1
-    private let surfacePerspectiveScale: Float = 24
+    /// Magnifies the walkable sphere vs orbital body radius. Lower = stronger
+    /// horizon drop when walking away from props (was 24; contract aims lower).
+    private let surfacePerspectiveScale: Float = 6
+    /// Forest density per tile (kept independent of perspective scale).
+    private let surfaceTreesPerTile = 14
     private let surfaceTileSize: Float = 54
     private let surfaceTileRadius = 1
     private let expandedBiomeElevation: Float = 0.32
@@ -629,6 +940,35 @@ final class UniverseStreamer {
     }
     var investigatedWreckageCount: Int {
         discoveries.investigatedWreckageCount
+    }
+
+    var startingStation: PointOfInterestDescriptor {
+        generator.startingStation()
+    }
+
+    func startingStationNavigationTarget() -> NearbyNavigationTarget {
+        let station = startingStation
+        let region = generator.region(at: .origin)
+        let pointIndex =
+            region.pointsOfInterest.firstIndex {
+                $0.kind == .station && $0.name == station.name
+            } ?? 0
+        let identifier =
+            "0,0,0:\(pointIndex):\(station.kind.rawValue):\(station.name)"
+        return NearbyNavigationTarget(
+            identifier: identifier,
+            name: station.name,
+            kind: .station,
+            vector: -SIMD3<Float>(station.localPosition),
+            distance: Float(simd_length(station.localPosition)),
+            radius: UniverseScale.stationRadius,
+            celestialKind: nil,
+            hasAtmosphere: false,
+            hostPlanetName: station.hostPlanetName,
+            hostPlanetKind: station.hostPlanetKind,
+            specialtyFamily: station.specialtyFamily,
+            systemSector: .origin
+        )
     }
 
     init(root: Entity, universeSeed: UInt64 = 0x5350_4143_4550_494C) {
@@ -652,6 +992,7 @@ final class UniverseStreamer {
 
         let obsoleteSectors = loadedRegions.keys.filter { !required.contains($0) }
         for loadedSector in obsoleteSectors {
+            unregisterRegionDestinations(sector: loadedSector)
             loadedRegions.removeValue(forKey: loadedSector)?.entity.removeFromParent()
         }
 
@@ -688,6 +1029,8 @@ final class UniverseStreamer {
             region.entity.removeFromParent()
         }
         loadedRegions.removeAll()
+        destinationRefs.removeAll()
+        bodyEntityRefs.removeAll()
         regionChildSimulationPositions.removeAll()
         renderOrigin = nil
         centerSector = nil
@@ -757,6 +1100,7 @@ final class UniverseStreamer {
             biomeHalfDepth: biome.halfDepth,
             loadedTiles: [:],
             resourceHealth: [:],
+            scannedResourceIDs: [],
             creatureStates: [:],
             wildlifeAnimationTime: 0,
             pendingCreatureHits: 0,
@@ -769,7 +1113,9 @@ final class UniverseStreamer {
            let expandedBiome = makeExpandedBiomeSurface(state: state) {
             surfaceRoot.addChild(expandedBiome)
         }
-        surfaceExplorationState = state
+        var explorationState = state
+        registerMarkerObstacles(state: &explorationState)
+        surfaceExplorationState = explorationState
         let terrainElevation =
             record.body.hasAtmosphere ? expandedBiomeElevation : 0
         let desiredDistance =
@@ -818,33 +1164,66 @@ final class UniverseStreamer {
 
         for coordinate in state.loadedTiles.keys
             where !required.contains(coordinate) {
-            state.loadedTiles.removeValue(forKey: coordinate)?
-                .removeFromParent()
+            if let tile = state.loadedTiles.removeValue(forKey: coordinate) {
+                unregisterTileContents(
+                    tile: tile,
+                    coordinate: coordinate,
+                    state: &state
+                )
+                tile.removeFromParent()
+            }
+        }
+
+        state.pendingTileCoordinates.removeAll {
+            !required.contains($0)
         }
         for coordinate in required
-            where state.loadedTiles[coordinate] == nil {
+            where state.loadedTiles[coordinate] == nil
+            && !state.pendingTileCoordinates.contains(coordinate) {
+            state.pendingTileCoordinates.append(coordinate)
+        }
+        state.pendingTileCoordinates.sort {
+            tileManhattanDistance($0, to: center)
+                < tileManhattanDistance($1, to: center)
+        }
+
+        let coordinateToLoad: SurfaceTileCoordinate?
+        if state.loadedTiles[center] == nil, required.contains(center) {
+            coordinateToLoad = center
+        } else if let next = state.pendingTileCoordinates.first(
+            where: { state.loadedTiles[$0] == nil }
+        ) {
+            coordinateToLoad = next
+        } else {
+            coordinateToLoad = nil
+        }
+        if let coordinate = coordinateToLoad {
             let tile = makeSurfaceTile(
                 coordinate: coordinate,
                 state: state
             )
             state.root.addChild(tile)
             state.loadedTiles[coordinate] = tile
+            registerTileContents(
+                tile: tile,
+                coordinate: coordinate,
+                state: &state
+            )
+            state.pendingTileCoordinates.removeAll { $0 == coordinate }
         }
+
         updateSurfaceSecurityRobots(
-            in: state.root,
             toward: surfacePoint,
-            state: state
+            state: &state
         )
         let simulationDelta = max(0, min(deltaTime, 0.05))
         state.wildlifeAnimationTime += simulationDelta
         updateSurfaceCreatures(
-            in: state.root,
             toward: surfacePoint,
             deltaTime: simulationDelta,
             state: &state
         )
         updateHealthDisplaysFacingPlayer(
-            in: state.root,
             toward: surfacePoint,
             state: state
         )
@@ -858,6 +1237,36 @@ final class UniverseStreamer {
 
     var activeSurfaceRadius: Float? {
         surfaceExplorationState?.effectiveRadius
+    }
+
+    /// Snaps a galactic position onto the active walkable shell so saved
+    /// ship/rover/player coords from an older `surfacePerspectiveScale`
+    /// still match the current exploration sphere and enter-range checks.
+    func reprojectOntoSurfaceShell(
+        _ position: GalacticPosition,
+        includeEyeHeight: Bool = true
+    ) -> GalacticPosition? {
+        guard let state = surfaceExplorationState,
+              let world = destination(
+                identifiedBy: state.worldIdentifier,
+                to: position
+              ),
+              world.distance > 0.001 else {
+            return nil
+        }
+        let outward = simd_normalize(-world.vector)
+        let elevation = surfaceElevation(around: position)
+        let desiredDistance =
+            state.effectiveRadius
+            + (includeEyeHeight ? UniverseScale.surfaceEyeHeight : 0)
+            + elevation
+        let radialDelta = desiredDistance - world.distance
+        guard abs(radialDelta) > 0.001 else { return position }
+        var projected = position
+        projected.translate(
+            by: SIMD3<Double>(outward * radialDelta)
+        )
+        return projected
     }
 
     func consumeCreatureAttacks() -> (
@@ -975,56 +1384,104 @@ final class UniverseStreamer {
         let targetName: String
         let radius: Float
         switch tool {
-        case .sonicSlicer:
+        case .sonicSlicer, .axe:
             targetName = "Surface Forest Tree"
-            radius = 3.2
+            radius = 6.5
         case .matterCrumbler:
             targetName = "Collectible Mineral"
             radius = 12
         case .empty, .matterLauncher, .analyzer:
             return nil
         }
-        var nearest: Entity?
-        var nearestDistance = radius
+        var candidates: [(entity: Entity, distance: Float)] = []
 
         func inspect(_ entity: Entity) {
-            if entity.name == targetName
-                || (tool == .sonicSlicer
-                    && entity.name.hasPrefix(
-                        "Surface Forest Tree|"
-                    ))
-                || (tool == .matterCrumbler
-                    && entity.name.hasPrefix(
-                        "Collectible Mineral|"
-                    ))
-                || (tool == .matterCrumbler
-                    && entity.name.hasPrefix("Surface Creature|"))
-                || (tool == .sonicSlicer
-                    && entity.name.hasPrefix("Surface Creature|")) {
-                let offset =
-                    entity.position(relativeTo: nil) - point
+            let isCreature = entity.name.hasPrefix("Surface Creature|")
+            let isTree =
+                entity.name == targetName
+                || entity.name.hasPrefix("Surface Forest Tree|")
+            let isMineral =
+                entity.name == targetName
+                || entity.name.hasPrefix("Collectible Mineral|")
+            let isValidTarget =
+                ((tool == .sonicSlicer || tool == .axe)
+                    && (isTree || (tool == .sonicSlicer && isCreature)))
+                || (tool == .matterCrumbler && (isMineral || isCreature))
+            if isValidTarget {
+                // Creatures / trees pivot at the feet; aim mid-body so swings
+                // from standing height register without planting the tip on
+                // the ground origin.
+                let rootPosition = entity.position(relativeTo: nil)
+                let up = simd_length_squared(rootPosition) > 0.000_001
+                    ? simd_normalize(rootPosition)
+                    : SIMD3<Float>(0, 1, 0)
+                let aimPosition: SIMD3<Float>
+                if isCreature {
+                    let bodyLift = 1.15 * max(entity.scale.y, 0.55)
+                    aimPosition = rootPosition + up * bodyLift
+                } else if isTree {
+                    let trunkLift = 1.45 * max(entity.scale.y, 0.7)
+                    aimPosition = rootPosition + up * trunkLift
+                } else {
+                    aimPosition = rootPosition
+                }
+                let offset = aimPosition - point
+                let hitRadius: Float =
+                    if tool == .sonicSlicer || tool == .axe {
+                        isCreature ? max(radius, 8.5) : max(radius, 7.5)
+                    } else {
+                        radius
+                    }
                 let distance: Float
-                if tool == .matterCrumbler, let direction {
+                if let direction {
                     let aim = simd_normalize(direction)
                     let forward = simd_dot(offset, aim)
                     let perpendicular = simd_length(
                         offset - aim * forward
                     )
-                    guard forward >= 0,
-                          forward <= radius,
-                          perpendicular <= 1.35 else {
+                    if tool == .matterCrumbler {
+                        let beamWidth: Float = isCreature ? 2.4 : 1.35
+                        guard forward >= -0.35,
+                              forward <= hitRadius,
+                              perpendicular <= beamWidth else {
+                            for child in entity.children {
+                                inspect(child)
+                            }
+                            return
+                        }
+                        distance = max(0, forward) + perpendicular * 0.6
+                    } else {
+                        // Sonic slicer swipe cone — forgiving near-trunk swings.
+                        let bladeWidth: Float =
+                            isCreature ? 3.4 : (isTree ? 3.6 : 2.2)
+                        let nearSwing = simd_length(offset) <= 3.2
+                        guard forward >= (nearSwing ? -1.4 : -0.6),
+                              forward <= hitRadius,
+                              perpendicular <= bladeWidth
+                                || (nearSwing
+                                    && simd_length(offset) <= hitRadius)
+                        else {
+                            for child in entity.children {
+                                inspect(child)
+                            }
+                            return
+                        }
+                        distance =
+                            nearSwing
+                                ? simd_length(offset)
+                                : max(0, forward) + perpendicular * 0.45
+                    }
+                } else {
+                    distance = simd_length(offset)
+                    guard distance <= hitRadius else {
                         for child in entity.children {
                             inspect(child)
                         }
                         return
                     }
-                    distance = forward + perpendicular * 0.6
-                } else {
-                    distance = simd_length(offset)
                 }
-                if distance <= nearestDistance {
-                    nearest = entity
-                    nearestDistance = distance
+                if distance <= hitRadius {
+                    candidates.append((entity, distance))
                 }
             }
             for child in entity.children {
@@ -1032,68 +1489,133 @@ final class UniverseStreamer {
             }
         }
         inspect(state.root)
-        guard let nearest, let parent = nearest.parent else { return nil }
-        if nearest.name.hasPrefix("Surface Creature|") {
-            let stateKey = nearest.name
-            var creatureState = state.creatureStates[stateKey]
-                ?? CreatureRuntimeState(
-                    position: .zero,
-                    altitude: 0,
-                    behavior: .roaming,
-                    health: 100,
-                    stunRemaining: 0,
-                    retreatRemaining: 0,
-                    impactFlashRemaining: 0,
-                    crumblerFlashRemaining: 0,
-                    attackCooldownRemaining: 0,
-                    avoidanceObstacleIdentifier: nil,
-                    avoidanceSide: 0
-                )
-            let creatureDamage: Float =
-                tool == .sonicSlicer
-                    ? 40
-                    : (damageAmount ?? 34) * 0.2
-            creatureState.health = max(
-                0,
-                creatureState.health - creatureDamage
-            )
-            creatureState.retreatRemaining =
-                nearest.name.split(separator: "|").dropFirst().first == "1"
-                    ? 1.5
-                    : 3
-            if tool == .matterCrumbler {
-                creatureState.crumblerFlashRemaining = 0.32
-            } else {
-                creatureState.impactFlashRemaining = 0.32
+        candidates.sort { $0.distance < $1.distance }
+
+        if tool == .sonicSlicer || tool == .axe {
+            guard !candidates.isEmpty else { return nil }
+            var messages: [String] = []
+            var creatureHits = 0
+            var treeHits = 0
+            var neutralized = 0
+            var felled = 0
+            var droppedMaterials: [String] = []
+            // Snapshot entities so destroying one mid-loop is safe.
+            let swipeTargets = candidates.compactMap { candidate -> Entity? in
+                let name = candidate.entity.name
+                guard name.hasPrefix("Surface Creature|")
+                    || name.hasPrefix("Surface Forest Tree") else {
+                    return nil
+                }
+                if tool == .axe, name.hasPrefix("Surface Creature|") {
+                    return nil
+                }
+                return candidate.entity
             }
-            state.creatureStates[stateKey] = creatureState
-            updateResourceHealthBar(
-                on: nearest,
-                fraction: creatureState.health / 100,
-                height: 2.25
+            guard !swipeTargets.isEmpty else { return nil }
+            // One swing's power is split evenly across everything in the blade.
+            let swingPower: Float = tool == .axe ? 28 : 40
+            let sharedDamage = swingPower / Float(swipeTargets.count)
+            for target in swipeTargets {
+                guard target.parent != nil else { continue }
+                if target.name.hasPrefix("Surface Creature|") {
+                    let result = applySonicSlicerToCreature(
+                        target,
+                        state: &state,
+                        damageOverride: sharedDamage
+                    )
+                    creatureHits += 1
+                    if result.neutralized {
+                        neutralized += 1
+                    }
+                    if let drop = result.droppedMaterial {
+                        droppedMaterials.append(drop)
+                    }
+                } else if target.name.hasPrefix("Surface Forest Tree") {
+                    let result = applySonicSlicerToTree(
+                        target,
+                        state: &state,
+                        damageOverride: sharedDamage
+                    )
+                    treeHits += 1
+                    if result.destroyed {
+                        felled += 1
+                        droppedMaterials.append(result.materialName)
+                    }
+                }
+            }
+            surfaceExplorationState = state
+            if creatureHits + treeHits == 0 {
+                return nil
+            }
+            messages.append(
+                "SPLIT ×\(swipeTargets.count) (\(Int(sharedDamage.rounded())) DMG)"
+            )
+            if creatureHits > 0 {
+                if neutralized > 0 {
+                    messages.append(
+                        "\(neutralized) CREATURE"
+                            + (neutralized == 1 ? "" : "S")
+                            + " NEUTRALIZED"
+                    )
+                }
+                let wounded = creatureHits - neutralized
+                if wounded > 0 {
+                    messages.append(
+                        "\(wounded) CREATURE"
+                            + (wounded == 1 ? "" : "S")
+                            + " HIT"
+                    )
+                }
+            }
+            if treeHits > 0 {
+                if felled > 0 {
+                    messages.append(
+                        "\(felled) TREE"
+                            + (felled == 1 ? "" : "S")
+                            + " FELLED"
+                    )
+                }
+                let chipped = treeHits - felled
+                if chipped > 0 {
+                    messages.append(
+                        "\(chipped) TREE"
+                            + (chipped == 1 ? "" : "S")
+                            + " HIT"
+                    )
+                }
+            }
+            if let firstDrop = droppedMaterials.first {
+                messages.append("\(firstDrop) DROPPED")
+            }
+            return "\(tool.rawValue) • " + messages.joined(separator: " • ")
+        }
+
+        guard let nearest = candidates.first?.entity,
+              let parent = nearest.parent else {
+            return nil
+        }
+        // Matter crumbler is continuous-only. A missing tick amount used to
+        // fall back to a full 34 burst and felt like instant damage.
+        guard let tickDamage = damageAmount, tickDamage > 0 else {
+            return nil
+        }
+        if nearest.name.hasPrefix("Surface Creature|") {
+            let result = applySonicSlicerToCreature(
+                nearest,
+                state: &state,
+                damageOverride: tickDamage * 0.2,
+                isCrumbler: true
             )
             surfaceExplorationState = state
-            if creatureState.health <= 0 {
-                let droppedMaterial = spawnCreatureDropIfNeeded(
-                    from: nearest,
-                    state: state
-                )
-                nearest.removeFromParent()
+            if result.neutralized {
                 return "\(tool.rawValue) • CREATURE NEUTRALIZED"
-                    + (droppedMaterial.map { " • \($0) DROPPED" } ?? "")
+                    + (result.droppedMaterial.map { " • \($0) DROPPED" } ?? "")
             }
-            return "\(tool.rawValue) • CREATURE \(Int(creatureState.health.rounded())) HP"
+            return "\(tool.rawValue) • CREATURE \(Int(result.remainingHealth.rounded())) HP"
         }
         let healthKey = ObjectIdentifier(nearest)
-        let damage: Float = switch tool {
-        case .sonicSlicer: 34
-        case .matterCrumbler: damageAmount ?? 34
-        case .empty, .matterLauncher, .analyzer: 0
-        }
-        let maximumHealth: Float =
-            tool == .matterCrumbler
-                ? mineralDepositHealth(encodedIn: nearest.name)
-                : 100
+        let damage = tickDamage
+        let maximumHealth = mineralDepositHealth(encodedIn: nearest.name)
         let remainingHealth = max(
             0,
             (state.resourceHealth[healthKey] ?? maximumHealth) - damage
@@ -1103,77 +1625,233 @@ final class UniverseStreamer {
         updateResourceHealthBar(
             on: nearest,
             fraction: healthFraction,
-            height: tool == .sonicSlicer
-                ? 4.6
-                : 0.72
-                    + Float(mineralDepositTier(encodedIn: nearest.name))
-                        * 0.12
+            height: resourceHealthBarLocalHeight(for: nearest)
         )
         surfaceExplorationState = state
         guard remainingHealth <= 0 else {
-            let target = tool == .sonicSlicer ? "TREE" : "MINERAL"
             let healthPercent = Int((healthFraction * 100).rounded())
-            return "\(tool.rawValue) ACTIVATED • \(target) \(healthPercent)% HEALTH"
+            return "\(tool.rawValue) ACTIVATED • MINERAL \(healthPercent)% HEALTH"
         }
         state.resourceHealth.removeValue(forKey: healthKey)
         let transform = nearest.transform
+        let destroyedCoordinate = tileCoordinate(for: nearest, state: state)
         if let resourceIdentifier =
             surfaceResourceIdentifier(encodedIn: nearest.name) {
             surfaceResources.deplete(resourceIdentifier)
         }
+        removeCachedObstacle(for: nearest, state: &state)
+        removeHealthBar(for: nearest, state: &state)
         nearest.removeFromParent()
 
-        let materialName: String
         let looseGroup = Entity()
         looseGroup.transform = transform
         parent.addChild(looseGroup)
         let burst = ModelEntity(
-            mesh: .generateSphere(radius: tool == .sonicSlicer ? 0.72 : 0.46),
+            mesh: .generateSphere(radius: 0.46),
             materials: [
                 UnlitMaterial(
-                    color: tool == .sonicSlicer
-                        ? UIColor.systemGreen.withAlphaComponent(0.72)
-                        : UIColor.systemCyan.withAlphaComponent(0.82)
+                    color: UIColor.systemCyan.withAlphaComponent(0.82)
                 )
             ]
         )
         burst.name = "Resource Destruction Burst"
-        burst.position.y = tool == .sonicSlicer ? 1.4 : 0.7
+        burst.position.y = 0.7
         looseGroup.addChild(burst)
         Task { @MainActor [weak burst] in
             try? await Task.sleep(for: .milliseconds(260))
             burst?.removeFromParent()
         }
-        switch tool {
-        case .sonicSlicer:
-            materialName = logMaterialName(for: state.body.kind)
-            addLooseLogs(
-                to: looseGroup,
-                materialName: materialName,
-                color: logMaterialColor(for: state.body.kind)
+        let isRelic = mineralIsRelic(encodedIn: nearest.name)
+        let resourceID = surfaceResourceIdentifier(encodedIn: nearest.name)
+        let scanned =
+            resourceID.map { state.scannedResourceIDs.contains($0) } == true
+        var dropCount = mineralDepositDropCount(encodedIn: nearest.name)
+        if isRelic {
+            dropCount = max(dropCount, 8)
+        }
+        if scanned {
+            dropCount = Int(
+                (Float(dropCount) * ProgressionEconomy.scannedYieldMultiplier)
+                    .rounded(.up)
             )
-        case .matterCrumbler:
-            materialName =
+        }
+        let materialName: String =
+            if isRelic {
+                "Relic Fragment"
+            } else {
                 mineralName(encodedIn: nearest.name)
                     ?? mineralMaterialName(for: state.body.kind)
-            addLooseMineralPieces(
-                to: looseGroup,
-                materialName: materialName,
-                color: mineralMaterialColor(
+            }
+        addLooseMineralPieces(
+            to: looseGroup,
+            materialName: materialName,
+            color: isRelic
+                ? .systemYellow
+                : mineralMaterialColor(
                     for: state.body.kind,
                     materialName: materialName
                 ),
-                count: mineralDepositDropCount(
-                    encodedIn: nearest.name
-                )
+            count: dropCount
+        )
+        // Rare Relic Key drop from finished mineral/relic formations.
+        var keyNote = ""
+        if Float.random(in: 0..<1) < ProgressionEconomy.relicKeyDropChance {
+            let key = ModelEntity(
+                mesh: .generateBox(width: 0.12, height: 0.04, depth: 0.22),
+                materials: [
+                    UnlitMaterial(color: .systemPurple)
+                ]
             )
-        case .empty, .matterLauncher, .analyzer:
-            return nil
+            key.name = "Loose Relic Key|Relic Key"
+            key.position = [0.2, 0.08, 0.15]
+            looseGroup.addChild(key)
+            keyNote = " • RELIC KEY DROPPED"
+        }
+        if let coordinate = destroyedCoordinate {
+            rebuildTileObstacles(
+                coordinate: coordinate,
+                state: &state
+            )
         }
         surfaceExplorationState = state
-        return tool == .sonicSlicer
-            ? "SONIC SLICER ACTIVATED • \(materialName) LOGS DROPPED"
-            : "MATTER CRUMBLER ACTIVATED • \(materialName) SCATTERED"
+        let scanNote = scanned ? " • SCANNED +33%" : ""
+        return "MATTER CRUMBLER ACTIVATED • \(materialName) SCATTERED"
+            + scanNote + keyNote
+    }
+
+    private func applySonicSlicerToCreature(
+        _ target: Entity,
+        state: inout SurfaceExplorationState,
+        damageOverride: Float? = nil,
+        isCrumbler: Bool = false
+    ) -> (
+        neutralized: Bool,
+        remainingHealth: Float,
+        droppedMaterial: String?
+    ) {
+        let stateKey = target.name
+        let components = target.name.split(separator: "|")
+        let homeX = components.count > 2 ? Double(components[2]) : nil
+        let homeZ = components.count > 3 ? Double(components[3]) : nil
+        var creatureState = state.creatureStates[stateKey]
+            ?? CreatureRuntimeState(
+                position: SIMD2<Double>(
+                    homeX ?? 0,
+                    homeZ ?? 0
+                ),
+                altitude: 0,
+                behavior: .roaming,
+                health: 100,
+                stunRemaining: 0,
+                retreatRemaining: 0,
+                impactFlashRemaining: 0,
+                crumblerFlashRemaining: 0,
+                attackCooldownRemaining: 0,
+                avoidanceObstacleIdentifier: nil,
+                avoidanceSide: 0
+            )
+        let creatureDamage = max(1, damageOverride ?? 40)
+        creatureState.health = max(
+            0,
+            creatureState.health - creatureDamage
+        )
+        let isAggressive = components.dropFirst().first == "1"
+        creatureState.retreatRemaining = isAggressive ? 1.5 : 3
+        if isCrumbler {
+            creatureState.crumblerFlashRemaining = 0.32
+        } else {
+            creatureState.impactFlashRemaining = 0.32
+        }
+        state.creatureStates[stateKey] = creatureState
+        updateResourceHealthBar(
+            on: target,
+            fraction: creatureState.health / 100,
+            height: resourceHealthBarLocalHeight(for: target)
+        )
+        if creatureState.health <= 0 {
+            let droppedMaterial = spawnCreatureDropIfNeeded(
+                from: target,
+                state: state
+            )
+            removeTrackedCreature(for: target, state: &state)
+            target.removeFromParent()
+            return (true, 0, droppedMaterial)
+        }
+        return (false, creatureState.health, nil)
+    }
+
+    private func applySonicSlicerToTree(
+        _ target: Entity,
+        state: inout SurfaceExplorationState,
+        damageOverride: Float? = nil
+    ) -> (destroyed: Bool, materialName: String) {
+        let materialName = logMaterialName(for: state.body.kind)
+        guard let parent = target.parent else {
+            return (false, materialName)
+        }
+        let healthKey = ObjectIdentifier(target)
+        let damage = max(1, damageOverride ?? 34)
+        let maximumHealth: Float = 100
+        let remainingHealth = max(
+            0,
+            (state.resourceHealth[healthKey] ?? maximumHealth) - damage
+        )
+        let healthFraction = remainingHealth / maximumHealth
+        state.resourceHealth[healthKey] = remainingHealth
+        updateResourceHealthBar(
+            on: target,
+            fraction: healthFraction,
+            height: resourceHealthBarLocalHeight(for: target)
+        )
+        guard remainingHealth <= 0 else {
+            return (false, materialName)
+        }
+        state.resourceHealth.removeValue(forKey: healthKey)
+        let transform = target.transform
+        let destroyedCoordinate = tileCoordinate(for: target, state: state)
+        if let resourceIdentifier =
+            surfaceResourceIdentifier(encodedIn: target.name) {
+            surfaceResources.deplete(resourceIdentifier)
+        }
+        removeCachedObstacle(for: target, state: &state)
+        removeHealthBar(for: target, state: &state)
+        target.removeFromParent()
+
+        let looseGroup = Entity()
+        looseGroup.transform = transform
+        parent.addChild(looseGroup)
+        let burst = ModelEntity(
+            mesh: .generateSphere(radius: 0.72),
+            materials: [
+                UnlitMaterial(
+                    color: UIColor.systemGreen.withAlphaComponent(0.72)
+                )
+            ]
+        )
+        burst.name = "Resource Destruction Burst"
+        burst.position.y = 1.4
+        looseGroup.addChild(burst)
+        Task { @MainActor [weak burst] in
+            try? await Task.sleep(for: .milliseconds(260))
+            burst?.removeFromParent()
+        }
+        let resourceID = surfaceResourceIdentifier(encodedIn: target.name)
+        let scanned =
+            resourceID.map { state.scannedResourceIDs.contains($0) } == true
+        let logCount = scanned ? 4 : 3
+        addLooseLogs(
+            to: looseGroup,
+            materialName: materialName,
+            color: logMaterialColor(for: state.body.kind),
+            count: logCount
+        )
+        if let coordinate = destroyedCoordinate {
+            rebuildTileObstacles(
+                coordinate: coordinate,
+                state: &state
+            )
+        }
+        return (true, materialName)
     }
 
     private func updateResourceHealthBar(
@@ -1189,7 +1867,6 @@ final class UniverseStreamer {
         } else {
             bar = Entity()
             bar.name = "Resource Health Bar"
-            bar.position.y = height
             let background = ModelEntity(
                 mesh: .generateBox(
                     width: 0.92,
@@ -1213,7 +1890,20 @@ final class UniverseStreamer {
             )
             fill.name = "Resource Health Fill"
             bar.addChild(fill)
+            // Face the player's view continuously (square-on), not the
+            // surface-body point used by the old manual look-at.
+            bar.components.set(BillboardComponent())
             resource.addChild(bar)
+            if var state = surfaceExplorationState {
+                registerHealthBar(bar, state: &state)
+                surfaceExplorationState = state
+            }
+        }
+        // Always re-seat above the current visual top so upright art
+        // changes cannot leave the bar buried inside the mesh.
+        bar.position.y = height
+        if bar.components[BillboardComponent.self] == nil {
+            bar.components.set(BillboardComponent())
         }
         guard let fill = bar.findEntity(
             named: "Resource Health Fill"
@@ -1235,44 +1925,90 @@ final class UniverseStreamer {
         }
     }
 
+    /// Local +Y for a health bar so it sits above the silhouette, not inside it.
+    private func resourceHealthBarLocalHeight(
+        for resource: Entity
+    ) -> Float {
+        if resource.name.hasPrefix("Collectible Mineral|") {
+            return mineralVisualTopLocalHeight(for: resource) + 0.28
+        }
+        if resource.name.hasPrefix("Surface Forest Tree|") {
+            return treeVisualTopLocalHeight(for: resource) + 0.4
+        }
+        if resource.name.hasPrefix("Surface Creature|") {
+            return max(2.25, creatureVisualTopLocalHeight(for: resource) + 0.3)
+        }
+        if resource.name.hasPrefix("Surface Security Robot|") {
+            return 2.05
+        }
+        return 1.6
+    }
+
+    private func mineralVisualTopLocalHeight(
+        for formation: Entity
+    ) -> Float {
+        var top: Float = 0.28
+        for child in formation.children
+            where child.name != "Resource Health Bar" {
+            // Lying crystals: after π/2 around X, mesh depth becomes vertical.
+            let halfVertical =
+                0.275 * max(abs(child.scale.z), abs(child.scale.x))
+            top = max(top, child.position.y + halfVertical)
+        }
+        return top
+    }
+
+    private func treeVisualTopLocalHeight(
+        for tree: Entity
+    ) -> Float {
+        var top: Float = 2.8
+        for child in tree.children
+            where child.name != "Resource Health Bar" {
+            if abs(child.position.y - 3.15) < 0.35 {
+                // Canopy sphere base radius 1.15, then child scale.
+                top = max(
+                    top,
+                    child.position.y + 1.15 * abs(child.scale.y)
+                )
+            } else if abs(child.position.y - 1.4) < 0.2 {
+                top = max(top, child.position.y + 1.4)
+            }
+        }
+        return top
+    }
+
+    private func creatureVisualTopLocalHeight(
+        for creature: Entity
+    ) -> Float {
+        var top: Float = 1.6
+        func walk(_ entity: Entity) {
+            if entity.name == "Resource Health Bar" { return }
+            if entity !== creature {
+                top = max(top, entity.position.y + 0.55 * abs(entity.scale.y))
+            }
+            for child in entity.children {
+                walk(child)
+            }
+        }
+        walk(creature)
+        return top
+    }
+
     private func updateHealthDisplaysFacingPlayer(
-        in root: Entity,
         toward playerSurfacePoint: SIMD3<Float>,
         state: SurfaceExplorationState
     ) {
-        func update(_ entity: Entity) {
-            if entity.name == "Resource Health Bar", entity.isEnabled {
-                let position = entity.position(relativeTo: root)
-                let towardPlayer = playerSurfacePoint - position
-                guard simd_length_squared(towardPlayer) > 0.000_001 else {
-                    return
-                }
-                let forward = simd_normalize(towardPlayer)
-                let surfaceUp = simd_normalize(playerSurfacePoint)
-                var right = simd_cross(surfaceUp, forward)
-                if simd_length_squared(right) < 0.000_001 {
-                    right = state.tangentRight
-                } else {
-                    right = simd_normalize(right)
-                }
-                let displayUp = simd_normalize(
-                    simd_cross(forward, right)
-                )
-                entity.setOrientation(
-                    simd_quatf(
-                        simd_float3x3(
-                            columns: (right, displayUp, forward)
-                        )
-                    ),
-                    relativeTo: root
-                )
-                return
+        _ = playerSurfacePoint
+        // BillboardComponent keeps the bar square-on to the headset camera.
+        // Here we only keep damaged bars seated above their owners.
+        for bar in state.healthBarEntities where bar.isEnabled {
+            if bar.components[BillboardComponent.self] == nil {
+                bar.components.set(BillboardComponent())
             }
-            for child in entity.children {
-                update(child)
+            if let parent = bar.parent {
+                bar.position.y = resourceHealthBarLocalHeight(for: parent)
             }
         }
-        update(root)
     }
 
     func analyzeSurfaceTarget(
@@ -1329,15 +2065,39 @@ final class UniverseStreamer {
         inspect(state.root)
         guard let nearest else { return nil }
         if nearest.name.hasPrefix("Surface Forest Tree") {
+            if let resourceID = surfaceResourceIdentifier(
+                encodedIn: nearest.name
+            ) {
+                var mutable = state
+                mutable.scannedResourceIDs.insert(resourceID)
+                surfaceExplorationState = mutable
+            }
             let materialName = logMaterialName(for: state.body.kind)
             return planetaryScanResult(
                 state: state,
                 identifier: "flora:\(materialName)",
                 label: "\(materialName) tree",
-                interaction: "slicer compatible"
+                interaction: "axe/slicer compatible • scanned +33% yield"
             )
         }
         if nearest.name.hasPrefix("Collectible Mineral") {
+            if let resourceID = surfaceResourceIdentifier(
+                encodedIn: nearest.name
+            ) {
+                var mutable = state
+                mutable.scannedResourceIDs.insert(resourceID)
+                surfaceExplorationState = mutable
+                state = mutable
+            }
+            if mineralIsRelic(encodedIn: nearest.name) {
+                return planetaryScanResult(
+                    state: state,
+                    identifier: "relic:\(state.worldIdentifier)",
+                    label: "RELIC",
+                    interaction:
+                        "confirmed Relic • pickup with Relic Key, or crumbler for fragments"
+                )
+            }
             let materialName =
                 mineralName(encodedIn: nearest.name)
                     ?? mineralMaterialName(for: state.body.kind)
@@ -1348,7 +2108,7 @@ final class UniverseStreamer {
                 state: state,
                 identifier: "mineral:\(materialName)",
                 label: "\(depositSize) \(materialName) formation",
-                interaction: "crumbler compatible"
+                interaction: "crumbler compatible • scanned +33% yield"
             )
         }
         if nearest.name.hasPrefix("Loose Log|") {
@@ -1490,7 +2250,7 @@ final class UniverseStreamer {
         }
         return collectLooseSurfacePile(
             centeredOn: nearest,
-            category: category,
+            matchingCategory: category,
             state: state
         )
     }
@@ -1503,23 +2263,24 @@ final class UniverseStreamer {
         guard let state = surfaceExplorationState else { return nil }
         let aim = simd_normalize(direction)
         var nearest: Entity?
-        var bestSelectionScore = Float.greatestFiniteMagnitude
+        var nearestDistance = Float.greatestFiniteMagnitude
         func inspect(_ entity: Entity) {
             if loosePickupCategory(for: entity) != nil {
                 let offset = entity.position(relativeTo: nil) - point
-                let forward = simd_dot(offset, aim)
-                let perpendicular = simd_length(offset - aim * forward)
-                let focusRadius = max(0.75, forward * 0.18)
-                if forward > 0,
-                   forward <= maximumDistance,
-                   perpendicular <= focusRadius {
-                    // Depth is primary so repeated gestures collect piles in
-                    // near-to-far order. Aim offset only breaks close ties.
-                    let selectionScore = forward + perpendicular * 0.35
-                    if selectionScore < bestSelectionScore {
-                        nearest = entity
-                        bestSelectionScore = selectionScore
-                    }
+                let distance = simd_length(offset)
+                guard distance > 0.04, distance <= maximumDistance else {
+                    return
+                }
+                let alignment =
+                    simd_dot(simd_normalize(offset), aim)
+                // General look direction is enough: ~50° cone, with a
+                // wider near-field so drops at the player's feet still count.
+                let inView =
+                    alignment >= 0.55
+                    || (distance <= 2.8 && alignment >= 0.12)
+                if inView, distance < nearestDistance {
+                    nearest = entity
+                    nearestDistance = distance
                 }
             }
             for child in entity.children {
@@ -1527,13 +2288,10 @@ final class UniverseStreamer {
             }
         }
         inspect(state.root)
-        guard let nearest,
-              let category = loosePickupCategory(for: nearest) else {
-            return nil
-        }
+        guard let nearest else { return nil }
         return collectLooseSurfacePile(
             centeredOn: nearest,
-            category: category,
+            matchingCategory: nil,
             state: state
         )
     }
@@ -1553,24 +2311,119 @@ final class UniverseStreamer {
         if entity.name.hasPrefix("Loose Creature Material|") {
             return .creatureMaterial
         }
+        if entity.name.hasPrefix("Loose Relic Key|") {
+            return .relicKey
+        }
         return nil
+    }
+
+    private func mineralIsRelic(encodedIn entityName: String) -> Bool {
+        entityName.split(separator: "|").map(String.init).contains("relic")
+    }
+
+    /// Intact Relic pickup after Analyzer confirmation (still looks like a mineral).
+    func collectScannedRelic(
+        from point: SIMD3<Float>,
+        direction: SIMD3<Float>,
+        maximumDistance: Float
+    ) -> SurfacePickup? {
+        guard var state = surfaceExplorationState else { return nil }
+        let aim = simd_normalize(direction)
+        var nearest: Entity?
+        var nearestDistance = Float.greatestFiniteMagnitude
+        func inspect(_ entity: Entity) {
+            guard entity.name.hasPrefix("Collectible Mineral|"),
+                  mineralIsRelic(encodedIn: entity.name),
+                  let resourceID = surfaceResourceIdentifier(
+                    encodedIn: entity.name
+                  ),
+                  state.scannedResourceIDs.contains(resourceID) else {
+                for child in entity.children { inspect(child) }
+                return
+            }
+            let offset = entity.position(relativeTo: nil) - point
+            let distance = simd_length(offset)
+            guard distance > 0.04, distance <= maximumDistance else {
+                for child in entity.children { inspect(child) }
+                return
+            }
+            let alignment = simd_dot(simd_normalize(offset), aim)
+            if alignment >= 0.45, distance < nearestDistance {
+                nearest = entity
+                nearestDistance = distance
+            }
+            for child in entity.children { inspect(child) }
+        }
+        inspect(state.root)
+        guard let nearest,
+              let parent = nearest.parent else { return nil }
+        let resourceID = surfaceResourceIdentifier(encodedIn: nearest.name)
+        if let resourceID {
+            surfaceResources.deplete(resourceID)
+            state.scannedResourceIDs.remove(resourceID)
+        }
+        removeCachedObstacle(for: nearest, state: &state)
+        removeHealthBar(for: nearest, state: &state)
+        let coordinate = tileCoordinate(for: nearest, state: state)
+        nearest.removeFromParent()
+        if let coordinate {
+            rebuildTileObstacles(coordinate: coordinate, state: &state)
+        }
+        surfaceExplorationState = state
+        _ = parent
+        return SurfacePickup(
+            materialName: "Relic",
+            category: .relic,
+            sourcePlanetIdentifier: state.worldIdentifier,
+            sourcePlanetName: state.body.name,
+            sourcePlanetKind: state.body.kind,
+            relicCanOpen: true
+        )
+    }
+
+    func nearestRelicDirection(
+        from origin: SIMD3<Float>
+    ) -> SIMD3<Float>? {
+        guard let state = surfaceExplorationState else { return nil }
+        var best: Entity?
+        var bestDistance = Float.greatestFiniteMagnitude
+        func inspect(_ entity: Entity) {
+            if entity.name.hasPrefix("Collectible Mineral|"),
+               mineralIsRelic(encodedIn: entity.name) {
+                let distance = simd_distance(
+                    entity.position(relativeTo: nil),
+                    origin
+                )
+                if distance < bestDistance {
+                    best = entity
+                    bestDistance = distance
+                }
+            }
+            for child in entity.children { inspect(child) }
+        }
+        inspect(state.root)
+        guard let best else { return nil }
+        let offset = best.position(relativeTo: nil) - origin
+        guard simd_length_squared(offset) > 0.000_1 else { return nil }
+        return simd_normalize(offset)
     }
 
     private func collectLooseSurfacePile(
         centeredOn primary: Entity,
-        category: SurfacePickup.Category,
+        matchingCategory: SurfacePickup.Category?,
         state: SurfaceExplorationState
     ) -> [SurfacePickup] {
-        let pileRadius: Float = 1.5
+        let pileRadius: Float = matchingCategory == nil ? 2.1 : 1.5
         let center = primary.position(relativeTo: nil)
-        var entities: [Entity] = []
+        var entities: [(Entity, SurfacePickup.Category)] = []
         func inspect(_ entity: Entity) {
-            if loosePickupCategory(for: entity) == category,
+            if let category = loosePickupCategory(for: entity),
+               matchingCategory == nil || matchingCategory == category,
                simd_distance(
                     entity.position(relativeTo: nil),
                     center
                ) <= pileRadius {
-                entities.append(entity)
+                entities.append((entity, category))
             }
             for child in entity.children {
                 inspect(child)
@@ -1578,7 +2431,7 @@ final class UniverseStreamer {
         }
         inspect(state.root)
 
-        let pickups = entities.compactMap { entity -> SurfacePickup? in
+        let pickups = entities.compactMap { entity, category -> SurfacePickup? in
             let components = entity.name.split(
                 separator: "|",
                 maxSplits: 1
@@ -1592,7 +2445,7 @@ final class UniverseStreamer {
                 sourcePlanetKind: state.body.kind
             )
         }
-        for entity in entities {
+        for (entity, _) in entities {
             entity.removeFromParent()
         }
         return pickups
@@ -1653,7 +2506,7 @@ final class UniverseStreamer {
             updateResourceHealthBar(
                 on: target,
                 fraction: creatureState.health / 100,
-                height: 2.25
+                height: resourceHealthBarLocalHeight(for: target)
             )
             surfaceExplorationState = state
             guard creatureState.health <= 0 else {
@@ -1663,6 +2516,7 @@ final class UniverseStreamer {
                 from: target,
                 state: state
             )
+            removeTrackedCreature(for: target, state: &state)
             target.removeFromParent()
             return "MATTER IMPACT • CREATURE NEUTRALIZED"
                 + (droppedMaterial.map { " • \($0) DROPPED" } ?? "")
@@ -1676,7 +2530,7 @@ final class UniverseStreamer {
             updateResourceHealthBar(
                 on: robot,
                 fraction: Float(remainingHits) / 3,
-                height: 1.9
+                height: resourceHealthBarLocalHeight(for: robot)
             )
             surfaceExplorationState = state
             return "MATTER IMPACT • SECURITY ROBOT \(remainingHits) HITS REMAIN"
@@ -1684,6 +2538,9 @@ final class UniverseStreamer {
 
         state.resourceHealth.removeValue(forKey: healthKey)
         let transform = robot.transform
+        removeTrackedRobot(for: robot, state: &state)
+        removeCachedObstacle(for: robot, state: &state)
+        removeHealthBar(for: robot, state: &state)
         robot.removeFromParent()
 
         let wreckage = Entity()
@@ -1874,14 +2731,15 @@ final class UniverseStreamer {
     private func addLooseLogs(
         to root: Entity,
         materialName: String,
-        color: UIColor
+        color: UIColor,
+        count: Int = 3
     ) {
         let material = SimpleMaterial(
             color: color,
             roughness: 0.86,
             isMetallic: false
         )
-        for index in 0..<3 {
+        for index in 0..<count {
             let log = ModelEntity(
                 mesh: .generateCylinder(height: 1.05, radius: 0.13),
                 materials: [material]
@@ -2139,13 +2997,17 @@ final class UniverseStreamer {
     private func bodyRecord(
         identifiedBy identifier: String
     ) -> (body: CelestialBodyDescriptor, entity: Entity)? {
+        if let ref = bodyEntityRefs[identifier] {
+            return (ref.body, ref.entity)
+        }
         for region in loadedRegions.values {
             for (bodyIndex, body) in region.descriptor.bodies.enumerated() {
                 let bodyIdentifier =
-                    "\(region.descriptor.sector.x),"
-                    + "\(region.descriptor.sector.y),"
-                    + "\(region.descriptor.sector.z):body:"
-                    + "\(bodyIndex):\(body.name)"
+                    bodyIdentifier(
+                        sector: region.descriptor.sector,
+                        bodyIndex: bodyIndex,
+                        body: body
+                    )
                 guard bodyIdentifier == identifier,
                       let entity = region.entity.findEntity(
                         named: body.name
@@ -2158,6 +3020,79 @@ final class UniverseStreamer {
         return nil
     }
 
+    private func bodyIdentifier(
+        sector: GalacticSector,
+        bodyIndex: Int,
+        body: CelestialBodyDescriptor
+    ) -> String {
+        "\(sector.x),\(sector.y),\(sector.z):body:\(bodyIndex):\(body.name)"
+    }
+
+    private func pointIdentifier(
+        sector: GalacticSector,
+        pointIndex: Int,
+        point: PointOfInterestDescriptor
+    ) -> String {
+        "\(sector.x),\(sector.y),\(sector.z):\(pointIndex):\(point.kind.rawValue):\(point.name)"
+    }
+
+    private func registerRegionDestinations(
+        _ descriptor: ProceduralRegion,
+        entity: Entity
+    ) {
+        let sector = descriptor.sector
+        for (bodyIndex, body) in descriptor.bodies.enumerated() {
+            let identifier = bodyIdentifier(
+                sector: sector,
+                bodyIndex: bodyIndex,
+                body: body
+            )
+            destinationRefs[identifier] = DestinationRef(
+                sector: sector,
+                target: .body(index: bodyIndex)
+            )
+            guard body.kind != .star,
+                  let bodyEntity = entity.findEntity(named: body.name) else {
+                continue
+            }
+            bodyEntityRefs[identifier] = BodyEntityRef(
+                sector: sector,
+                bodyIndex: bodyIndex,
+                body: body,
+                entity: bodyEntity,
+                upperAtmosphereDetail: bodyEntity.findEntity(
+                    named: "Upper Atmosphere Detail"
+                ),
+                lowerAtmosphereDetail: bodyEntity.findEntity(
+                    named: "Lower Atmosphere Detail"
+                ),
+                groundDetail: bodyEntity.findEntity(
+                    named: "Ground Detail"
+                )
+            )
+        }
+        for (pointIndex, point) in descriptor.pointsOfInterest.enumerated() {
+            let identifier = pointIdentifier(
+                sector: sector,
+                pointIndex: pointIndex,
+                point: point
+            )
+            destinationRefs[identifier] = DestinationRef(
+                sector: sector,
+                target: .point(index: pointIndex)
+            )
+        }
+    }
+
+    private func unregisterRegionDestinations(sector: GalacticSector) {
+        destinationRefs = destinationRefs.filter {
+            $0.value.sector != sector
+        }
+        bodyEntityRefs = bodyEntityRefs.filter {
+            $0.value.sector != sector
+        }
+    }
+
     private func loadRegionIfNeeded(at sector: GalacticSector) {
         guard loadedRegions[sector] == nil else { return }
         let descriptor = generator.region(at: sector)
@@ -2168,6 +3103,7 @@ final class UniverseStreamer {
         }
         root.addChild(entity)
         loadedRegions[sector] = (descriptor, entity)
+        registerRegionDestinations(descriptor, entity: entity)
         if let renderOrigin {
             updateRenderOrigin(around: renderOrigin)
         }
@@ -2186,54 +3122,53 @@ final class UniverseStreamer {
         around position: GalacticPosition,
         showGroundDetail: Bool
     ) {
-        for region in loadedRegions.values {
-            for body in region.descriptor.bodies where body.kind != .star {
-                let vector = position.vector(
-                    to: region.descriptor.sector,
-                    local: body.localPosition
-                )
-                let altitude = max(0, Float(simd_length(vector)) - body.radius)
-                guard let bodyEntity = region.entity.findEntity(named: body.name) else {
-                    continue
+        for ref in bodyEntityRefs.values where ref.body.kind != .star {
+            let vector = position.vector(
+                to: ref.sector,
+                local: ref.body.localPosition
+            )
+            let altitude = max(0, Float(simd_length(vector)) - ref.body.radius)
+            // Show readable orbital biome definition well before atmosphere entry.
+            let shouldShowRoughDetail = altitude <= 50_000
+            let shouldShowLowerDetail =
+                ref.body.hasAtmosphere
+                && altitude
+                <= UniverseScale.lowerAtmosphereDepth(for: ref.body.radius)
+                    * 1.15
+            if let roughDetail = ref.upperAtmosphereDetail {
+                let hasModernOrbitalMeshes = roughDetail.children.contains {
+                    $0.name.contains("GlobeV5")
                 }
-                let shouldShowRoughDetail = altitude <= 10_000
-                if let roughDetail = bodyEntity.findEntity(
-                    named: "Upper Atmosphere Detail"
-                ) {
-                    if shouldShowRoughDetail && roughDetail.children.isEmpty {
-                        if body.hasAtmosphere {
-                            addRoughSurfaceDetail(to: roughDetail, for: body)
-                        } else {
-                            addAirlessSurfaceDetail(to: roughDetail, for: body)
-                        }
+                if shouldShowRoughDetail && !hasModernOrbitalMeshes {
+                    for child in roughDetail.children {
+                        child.removeFromParent()
                     }
-                    roughDetail.isEnabled =
-                        shouldShowRoughDetail && !showGroundDetail
-                }
-                let shouldShowLowerDetail =
-                    body.hasAtmosphere
-                    && altitude
-                    <= UniverseScale.lowerAtmosphereDepth(for: body.radius)
-                        * 1.15
-                if let lowerDetail = bodyEntity.findEntity(
-                    named: "Lower Atmosphere Detail"
-                ) {
-                    if shouldShowLowerDetail && lowerDetail.children.isEmpty {
-                        addLowerSurfaceDetail(to: lowerDetail, for: body)
+                    if ref.body.kind != .star {
+                        addRoughSurfaceDetail(
+                            to: roughDetail,
+                            for: ref.body
+                        )
                     }
-                    lowerDetail.isEnabled =
-                        shouldShowLowerDetail && !showGroundDetail
                 }
+                roughDetail.isEnabled =
+                    shouldShowRoughDetail
+                    && !shouldShowLowerDetail
+                    && !showGroundDetail
+            }
+            if let lowerDetail = ref.lowerAtmosphereDetail {
+                if shouldShowLowerDetail && lowerDetail.children.isEmpty {
+                    addLowerSurfaceDetail(to: lowerDetail, for: ref.body)
+                }
+                lowerDetail.isEnabled =
+                    shouldShowLowerDetail && !showGroundDetail
+            }
 
-                let shouldShowGroundDetail = false
-                if let groundDetail = bodyEntity.findEntity(
-                    named: "Ground Detail"
-                ) {
-                    if shouldShowGroundDetail && groundDetail.children.isEmpty {
-                        addGroundSurfaceDetail(to: groundDetail, for: body)
-                    }
-                    groundDetail.isEnabled = shouldShowGroundDetail
+            let shouldShowGroundDetail = false
+            if let groundDetail = ref.groundDetail {
+                if shouldShowGroundDetail && groundDetail.children.isEmpty {
+                    addGroundSurfaceDetail(to: groundDetail, for: ref.body)
                 }
+                groundDetail.isEnabled = shouldShowGroundDetail
             }
         }
     }
@@ -2267,7 +3202,8 @@ final class UniverseStreamer {
                             distance: distance,
                             radius: body.radius,
                             celestialKind: body.kind,
-                            hasAtmosphere: body.hasAtmosphere
+                            hasAtmosphere: body.hasAtmosphere,
+                            systemSector: region.descriptor.sector
                         )
                     }
                 }
@@ -2292,7 +3228,11 @@ final class UniverseStreamer {
                             ? UniverseScale.stationRadius
                             : UniverseScale.wreckageRadius,
                         celestialKind: nil,
-                        hasAtmosphere: false
+                        hasAtmosphere: false,
+                        hostPlanetName: point.hostPlanetName,
+                        hostPlanetKind: point.hostPlanetKind,
+                        specialtyFamily: point.specialtyFamily,
+                        systemSector: region.descriptor.sector
                     )
                 }
             }
@@ -2304,9 +3244,57 @@ final class UniverseStreamer {
         identifiedBy identifier: String,
         to position: GalacticPosition
     ) -> NearbyNavigationTarget? {
+        if let ref = destinationRefs[identifier],
+           let region = loadedRegions[ref.sector] {
+            switch ref.target {
+            case .body(let bodyIndex):
+                let body = region.descriptor.bodies[bodyIndex]
+                let vector = position.vector(
+                    to: region.descriptor.sector,
+                    local: body.localPosition
+                )
+                return NearbyNavigationTarget(
+                    identifier: identifier,
+                    name: body.name,
+                    kind: .world,
+                    vector: SIMD3<Float>(vector),
+                    distance: Float(simd_length(vector)),
+                    radius: body.radius,
+                    celestialKind: body.kind,
+                    hasAtmosphere: body.hasAtmosphere,
+                    systemSector: region.descriptor.sector
+                )
+            case .point(let pointIndex):
+                let point = region.descriptor.pointsOfInterest[pointIndex]
+                let vector = position.vector(
+                    to: region.descriptor.sector,
+                    local: point.localPosition
+                )
+                return NearbyNavigationTarget(
+                    identifier: identifier,
+                    name: point.name,
+                    kind: point.kind == .station ? .station : .wreckage,
+                    vector: SIMD3<Float>(vector),
+                    distance: Float(simd_length(vector)),
+                    radius: point.kind == .station
+                        ? UniverseScale.stationRadius
+                        : UniverseScale.wreckageRadius,
+                    celestialKind: nil,
+                    hasAtmosphere: false,
+                    hostPlanetName: point.hostPlanetName,
+                    hostPlanetKind: point.hostPlanetKind,
+                    specialtyFamily: point.specialtyFamily,
+                    systemSector: region.descriptor.sector
+                )
+            }
+        }
         for region in loadedRegions.values {
             for (bodyIndex, body) in region.descriptor.bodies.enumerated() {
-                let bodyIdentifier = "\(region.descriptor.sector.x),\(region.descriptor.sector.y),\(region.descriptor.sector.z):body:\(bodyIndex):\(body.name)"
+                let bodyIdentifier = bodyIdentifier(
+                    sector: region.descriptor.sector,
+                    bodyIndex: bodyIndex,
+                    body: body
+                )
                 guard bodyIdentifier == identifier else { continue }
                 let vector = position.vector(
                     to: region.descriptor.sector,
@@ -2320,11 +3308,16 @@ final class UniverseStreamer {
                     distance: Float(simd_length(vector)),
                     radius: body.radius,
                     celestialKind: body.kind,
-                    hasAtmosphere: body.hasAtmosphere
+                    hasAtmosphere: body.hasAtmosphere,
+                    systemSector: region.descriptor.sector
                 )
             }
             for (pointIndex, point) in region.descriptor.pointsOfInterest.enumerated() {
-                let pointIdentifier = "\(region.descriptor.sector.x),\(region.descriptor.sector.y),\(region.descriptor.sector.z):\(pointIndex):\(point.kind.rawValue):\(point.name)"
+                let pointIdentifier = pointIdentifier(
+                    sector: region.descriptor.sector,
+                    pointIndex: pointIndex,
+                    point: point
+                )
                 guard pointIdentifier == identifier else { continue }
                 let vector = position.vector(
                     to: region.descriptor.sector,
@@ -2340,7 +3333,11 @@ final class UniverseStreamer {
                         ? UniverseScale.stationRadius
                         : UniverseScale.wreckageRadius,
                     celestialKind: nil,
-                    hasAtmosphere: false
+                    hasAtmosphere: false,
+                    hostPlanetName: point.hostPlanetName,
+                    hostPlanetKind: point.hostPlanetKind,
+                    specialtyFamily: point.specialtyFamily,
+                    systemSector: region.descriptor.sector
                 )
             }
         }
@@ -2374,7 +3371,8 @@ final class UniverseStreamer {
                         distance: distance,
                         radius: body.radius,
                         celestialKind: body.kind,
-                        hasAtmosphere: body.hasAtmosphere
+                        hasAtmosphere: body.hasAtmosphere,
+                        systemSector: region.descriptor.sector
                     )
                 }
             }
@@ -2402,7 +3400,11 @@ final class UniverseStreamer {
                             ? UniverseScale.stationRadius
                             : UniverseScale.wreckageRadius,
                         celestialKind: nil,
-                        hasAtmosphere: false
+                        hasAtmosphere: false,
+                        hostPlanetName: point.hostPlanetName,
+                        hostPlanetKind: point.hostPlanetKind,
+                        specialtyFamily: point.specialtyFamily,
+                        systemSector: region.descriptor.sector
                     )
                 }
             }
@@ -2440,7 +3442,8 @@ final class UniverseStreamer {
                         distance: distance,
                         radius: body.radius,
                         celestialKind: body.kind,
-                        hasAtmosphere: body.hasAtmosphere
+                        hasAtmosphere: body.hasAtmosphere,
+                        systemSector: region.descriptor.sector
                     )
                 )
             }
@@ -2471,7 +3474,11 @@ final class UniverseStreamer {
                             ? UniverseScale.stationRadius
                             : UniverseScale.wreckageRadius,
                         celestialKind: nil,
-                        hasAtmosphere: false
+                        hasAtmosphere: false,
+                        hostPlanetName: point.hostPlanetName,
+                        hostPlanetKind: point.hostPlanetKind,
+                        specialtyFamily: point.specialtyFamily,
+                        systemSector: region.descriptor.sector
                     )
                 )
             }
@@ -2562,12 +3569,14 @@ final class UniverseStreamer {
             if entity.name.hasPrefix("Surface Forest Tree|") {
                 collisionRadius =
                     1.55 * max(entity.scale.x, entity.scale.z)
-                collisionHeight = 1.55 * entity.scale.y
+                collisionHeight = 2.6 * entity.scale.y
                 isStepable = false
             } else if entity.name.hasPrefix("Collectible Mineral|") {
                 let tier = mineralDepositTier(encodedIn: entity.name)
-                collisionRadius = 0.72 + Float(tier) * 0.19
-                collisionHeight = 0.42 + Float(tier) * 0.08
+                // Low outcrops ~0.25–0.55 m above ground.
+                let platformTop = 0.28 + Float(tier) * 0.06
+                collisionRadius = 0.48 + Float(tier) * 0.08
+                collisionHeight = platformTop * 0.5
                 isStepable = true
             } else if entity.name.hasPrefix("Loose Mineral|")
                 || entity.name.hasPrefix("Loose Electronic|")
@@ -2575,7 +3584,7 @@ final class UniverseStreamer {
                 || entity.name.hasPrefix("Loose Creature Material|")
                 || entity.name.hasPrefix("Step Surface|") {
                 collisionRadius = 0.62
-                collisionHeight = 0.32
+                collisionHeight = 0.55
                 isStepable = true
             } else if entity.name.hasPrefix("Surface Creature|") {
                 collisionRadius =
@@ -2823,14 +3832,15 @@ final class UniverseStreamer {
         container.name = body.name
         container.position = SIMD3<Float>(body.localPosition)
 
-        let color = color(for: body.kind)
+        let color = orbitalBaseColor(for: body.kind)
         let material: any Material = body.kind == .star
             ? UnlitMaterial(color: color)
-            : SimpleMaterial(color: color, roughness: 0.72, isMetallic: false)
+            : UnlitMaterial(color: color)
         let sphere = ModelEntity(
             mesh: .generateSphere(radius: body.radius),
             materials: [material]
         )
+        sphere.name = "Planet Core"
         container.addChild(sphere)
 
         if body.kind == .star {
@@ -2842,29 +3852,27 @@ final class UniverseStreamer {
         }
 
         if body.kind != .star && body.hasAtmosphere {
-            let lowerAtmosphere = ModelEntity(
-                mesh: .generateSphere(
-                    radius: body.radius
-                        + UniverseScale.lowerAtmosphereDepth(for: body.radius)
-                ),
+            // Visual atmosphere only — keep it a thin limb so the globe and
+            // haze read as nearly the same size. Gameplay atmosphere depth is
+            // handled separately via UniverseScale.
+            let haze = atmosphereLimbColor(for: body.kind)
+            let innerGlow = ModelEntity(
+                mesh: .generateSphere(radius: body.radius * 1.018),
                 materials: [
-                    UnlitMaterial(color: color.withAlphaComponent(0.025))
+                    UnlitMaterial(color: haze.withAlphaComponent(0.14))
                 ]
             )
-            lowerAtmosphere.name = "Lower Atmosphere"
-            container.addChild(lowerAtmosphere)
+            innerGlow.name = "Lower Atmosphere"
+            container.addChild(innerGlow)
 
-            let upperAtmosphere = ModelEntity(
-                mesh: .generateSphere(
-                    radius: body.radius
-                        + UniverseScale.upperAtmosphereDepth(for: body.radius)
-                ),
+            let outerGlow = ModelEntity(
+                mesh: .generateSphere(radius: body.radius * 1.045),
                 materials: [
-                    UnlitMaterial(color: color.withAlphaComponent(0.008))
+                    UnlitMaterial(color: haze.withAlphaComponent(0.07))
                 ]
             )
-            upperAtmosphere.name = "Upper Atmosphere"
-            container.addChild(upperAtmosphere)
+            outerGlow.name = "Upper Atmosphere"
+            container.addChild(outerGlow)
         }
 
         if body.kind != .star {
@@ -2883,14 +3891,78 @@ final class UniverseStreamer {
         }
 
         if body.hasRings {
+            // Rings sit around the outer atmosphere band — outside lower atmo,
+            // not intersecting the globe or lower-atmosphere flight volume.
+            let lowerOuter =
+                body.radius
+                * (1 + ScaleAndSpeedContract.lowerAtmosphereFraction)
+            let upperOuter =
+                body.radius
+                * (1 + ScaleAndSpeedContract.totalAtmosphereFraction)
+            let innerRadius = lowerOuter * 1.02
+            let outerRadius = max(innerRadius * 1.08, upperOuter * 1.12)
             let ring = ModelEntity(
-                mesh: .generateCylinder(height: 0.035, radius: body.radius * 1.75),
-                materials: [UnlitMaterial(color: UIColor.systemYellow.withAlphaComponent(0.48))]
+                mesh: Self.makeAnnulusMesh(
+                    innerRadius: innerRadius,
+                    outerRadius: outerRadius,
+                    segments: 72
+                ),
+                materials: [
+                    UnlitMaterial(
+                        color: UIColor.systemYellow.withAlphaComponent(0.52)
+                    )
+                ]
             )
-            ring.orientation = simd_quatf(angle: .pi / 2.7, axis: SIMD3<Float>(1, 0, 0))
+            ring.name = "Planetary Rings"
+            ring.orientation = simd_quatf(
+                angle: .pi / 2.7,
+                axis: SIMD3<Float>(1, 0, 0)
+            )
             container.addChild(ring)
         }
         return container
+    }
+
+    private static func makeAnnulusMesh(
+        innerRadius: Float,
+        outerRadius: Float,
+        segments: Int
+    ) -> MeshResource {
+        var positions: [SIMD3<Float>] = []
+        var normals: [SIMD3<Float>] = []
+        var indices: [UInt32] = []
+        positions.reserveCapacity(segments * 2)
+        normals.reserveCapacity(segments * 2)
+        indices.reserveCapacity(segments * 6)
+
+        for i in 0..<segments {
+            let angle = Float(i) / Float(segments) * 2 * .pi
+            let c = cos(angle)
+            let s = sin(angle)
+            positions.append(SIMD3<Float>(c * innerRadius, 0, s * innerRadius))
+            positions.append(SIMD3<Float>(c * outerRadius, 0, s * outerRadius))
+            normals.append(SIMD3<Float>(0, 1, 0))
+            normals.append(SIMD3<Float>(0, 1, 0))
+        }
+
+        for i in 0..<segments {
+            let i0 = UInt32(i * 2)
+            let i1 = i0 + 1
+            let j = (i + 1) % segments
+            let j0 = UInt32(j * 2)
+            let j1 = j0 + 1
+            indices.append(contentsOf: [i0, i1, j1, i0, j1, j0])
+        }
+
+        var descriptor = MeshDescriptor(name: "PlanetaryAnnulus")
+        descriptor.positions = MeshBuffers.Positions(positions)
+        descriptor.normals = MeshBuffers.Normals(normals)
+        descriptor.primitives = .triangles(indices)
+        return (try? MeshResource.generate(from: [descriptor]))
+            ?? MeshResource.generateCylinder(
+                height: 0.04,
+                radius: outerRadius
+            )
     }
 
     private func expandedLandingBiome(
@@ -3202,6 +4274,374 @@ final class UniverseStreamer {
             <= normalizedLimit * normalizedLimit
     }
 
+    private func tileManhattanDistance(
+        _ coordinate: SurfaceTileCoordinate,
+        to center: SurfaceTileCoordinate
+    ) -> Int {
+        abs(coordinate.x - center.x) + abs(coordinate.z - center.z)
+    }
+
+    private func tileCoordinate(
+        for entity: Entity,
+        state: SurfaceExplorationState
+    ) -> SurfaceTileCoordinate? {
+        var current: Entity? = entity.parent
+        while let ancestor = current {
+            if ancestor.name.hasPrefix("Surface Tile ") {
+                let suffix = ancestor.name.dropFirst("Surface Tile ".count)
+                let components = suffix.split(separator: ",")
+                guard components.count == 2,
+                      let x = Int(components[0]),
+                      let z = Int(components[1]) else {
+                    return nil
+                }
+                return SurfaceTileCoordinate(x: x, z: z)
+            }
+            if ancestor === state.root {
+                break
+            }
+            current = ancestor.parent
+        }
+        return nil
+    }
+
+    private func obstacleIdentifier(for entity: Entity) -> String {
+        entity.name + "|" + String(describing: ObjectIdentifier(entity))
+    }
+
+    private func obstacleMetrics(
+        for entity: Entity
+    ) -> (radius: Float, height: Float)? {
+        guard entity.isEnabled else { return nil }
+        if entity.name.hasPrefix("Surface Forest Tree|") {
+            return (
+                1.55 * max(entity.scale.x, entity.scale.z),
+                2.6 * entity.scale.y
+            )
+        }
+        if entity.name.hasPrefix("Collectible Mineral|") {
+            let tier = mineralDepositTier(encodedIn: entity.name)
+            let platformTop = 0.28 + Float(tier) * 0.06
+            return (0.48 + Float(tier) * 0.08, platformTop)
+        }
+        if entity.name.hasPrefix("Loose Mineral|")
+            || entity.name.hasPrefix("Loose Electronic|")
+            || entity.name.hasPrefix("Loose Log|")
+            || entity.name.hasPrefix("Loose Creature Material|")
+            || entity.name.hasPrefix("Step Surface|") {
+            return (0.62, 1.1)
+        }
+        if entity.name == "Surface Base" {
+            return (4.6, 2.8)
+        }
+        if entity.name.hasPrefix("Surface Security Robot|") {
+            return (0.72, 1.64)
+        }
+        if entity.name == "Landed Ship" {
+            return (2.5, 2.2)
+        }
+        if entity.name == "Parked Rover" {
+            return (1.35, 1.3)
+        }
+        return nil
+    }
+
+    /// Planar (x, z) coordinates matching `projectedSurfaceDirection`.
+    private func planarCoordinates(
+        forSurfacePoint surfacePoint: SIMD3<Float>,
+        state: SurfaceExplorationState
+    ) -> SIMD2<Double> {
+        let direction = simd_normalize(surfacePoint)
+        let alongAnchor = simd_dot(direction, state.anchorNormal)
+        guard alongAnchor > 0.05 else {
+            let anchorPoint =
+                state.anchorNormal * state.effectiveRadius
+            let offset = surfacePoint - anchorPoint
+            return SIMD2<Double>(
+                Double(simd_dot(offset, state.tangentRight)),
+                Double(simd_dot(offset, state.tangentForward))
+            )
+        }
+        // Invert: normalize(R*anchor + right*x + forward*z) == direction
+        let lambda =
+            Double(state.effectiveRadius) / Double(alongAnchor)
+        return SIMD2<Double>(
+            lambda * Double(simd_dot(direction, state.tangentRight)),
+            lambda * Double(simd_dot(direction, state.tangentForward))
+        )
+    }
+
+    private func obstacleCenter(
+        for entity: Entity,
+        state: SurfaceExplorationState
+    ) -> SIMD2<Double> {
+        planarCoordinates(
+            forSurfacePoint: entity.position(relativeTo: state.root),
+            state: state
+        )
+    }
+
+    private func collectSurfaceObstacles(
+        in root: Entity,
+        state: SurfaceExplorationState
+    ) -> [CreatureObstacle] {
+        var obstacles: [CreatureObstacle] = []
+        func collect(from entity: Entity) {
+            guard entity.isEnabled else { return }
+            if let metrics = obstacleMetrics(for: entity) {
+                obstacles.append(
+                    CreatureObstacle(
+                        identifier: obstacleIdentifier(for: entity),
+                        center: obstacleCenter(for: entity, state: state),
+                        radius: Double(metrics.radius),
+                        height: Double(metrics.height),
+                        tileCoordinate: tileCoordinate(
+                            for: entity,
+                            state: state
+                        ),
+                        entity: entity
+                    )
+                )
+                return
+            }
+            for child in entity.children {
+                collect(from: child)
+            }
+        }
+        collect(from: root)
+        return obstacles
+    }
+
+    private func appendCachedObstacle(
+        entity: Entity,
+        coordinate: SurfaceTileCoordinate?,
+        state: inout SurfaceExplorationState
+    ) {
+        guard let metrics = obstacleMetrics(for: entity) else { return }
+        state.cachedObstacles.append(
+            CreatureObstacle(
+                identifier: obstacleIdentifier(for: entity),
+                center: obstacleCenter(for: entity, state: state),
+                radius: Double(metrics.radius),
+                height: Double(metrics.height),
+                tileCoordinate: coordinate,
+                entity: entity
+            )
+        )
+    }
+
+    private func registerHealthBar(
+        _ bar: Entity,
+        state: inout SurfaceExplorationState
+    ) {
+        guard !state.healthBarEntities.contains(where: { $0 === bar }) else {
+            return
+        }
+        state.healthBarEntities.append(bar)
+    }
+
+    private func removeHealthBar(
+        for resource: Entity,
+        state: inout SurfaceExplorationState
+    ) {
+        if let bar = resource.findEntity(named: "Resource Health Bar") {
+            state.healthBarEntities.removeAll { $0 === bar }
+        }
+    }
+
+    private func removeCachedObstacle(
+        for entity: Entity,
+        state: inout SurfaceExplorationState
+    ) {
+        let identifier = obstacleIdentifier(for: entity)
+        state.cachedObstacles.removeAll { $0.identifier == identifier }
+    }
+
+    private func removeTrackedCreature(
+        for entity: Entity,
+        state: inout SurfaceExplorationState
+    ) {
+        state.trackedCreatures.removeAll { $0.entity === entity }
+        removeHealthBar(for: entity, state: &state)
+    }
+
+    private func removeTrackedRobot(
+        for entity: Entity,
+        state: inout SurfaceExplorationState
+    ) {
+        state.trackedRobots.removeAll { $0.entity === entity }
+    }
+
+    private func registerMarkerObstacles(
+        state: inout SurfaceExplorationState
+    ) {
+        state.cachedObstacles.removeAll {
+            $0.identifier == state.shipObstacleIdentifier
+                || $0.identifier == state.roverObstacleIdentifier
+        }
+        appendCachedObstacle(
+            entity: state.shipMarker,
+            coordinate: nil,
+            state: &state
+        )
+        state.shipObstacleIdentifier =
+            state.cachedObstacles.last?.identifier
+        if state.roverMarker.isEnabled {
+            appendCachedObstacle(
+                entity: state.roverMarker,
+                coordinate: nil,
+                state: &state
+            )
+            state.roverObstacleIdentifier =
+                state.cachedObstacles.last?.identifier
+        } else {
+            state.roverObstacleIdentifier = nil
+        }
+    }
+
+    private func registerTileContents(
+        tile: Entity,
+        coordinate: SurfaceTileCoordinate,
+        state: inout SurfaceExplorationState
+    ) {
+        func walk(_ entity: Entity) {
+            if entity.name.hasPrefix("Surface Creature|") {
+                let components = entity.name.split(separator: "|")
+                guard components.count >= 9,
+                      let homeX = Float(components[2]),
+                      let homeZ = Float(components[3]),
+                      let heading = Float(components[4]),
+                      let speed = Float(components[5]),
+                      let phase = Float(components[6]) else {
+                    for child in entity.children {
+                        walk(child)
+                    }
+                    return
+                }
+                state.trackedCreatures.append(
+                    TrackedCreature(
+                        entity: entity,
+                        tileCoordinate: coordinate,
+                        stateKey: entity.name,
+                        isAggressive: components[1] == "1",
+                        homeX: homeX,
+                        homeZ: homeZ,
+                        baseHeading: heading,
+                        moveSpeed: speed,
+                        phase: phase,
+                        isWinged: components[8] != "none",
+                        hitFlash: entity.findEntity(
+                            named: "Creature Hit Flash"
+                        ),
+                        bodyEntity: entity.findEntity(
+                            named: "Creature Body"
+                        )
+                    )
+                )
+                if let bar = entity.findEntity(
+                    named: "Resource Health Bar"
+                ) {
+                    registerHealthBar(bar, state: &state)
+                }
+            } else if entity.name.hasPrefix("Surface Security Robot|") {
+                let components = entity.name.split(separator: "|")
+                guard components.count >= 3,
+                      let tileX = Float(components[1]),
+                      let tileZ = Float(components[2]) else {
+                    for child in entity.children {
+                        walk(child)
+                    }
+                    return
+                }
+                state.trackedRobots.append(
+                    TrackedRobot(
+                        entity: entity,
+                        tileCoordinate: coordinate,
+                        homeTileX: tileX,
+                        homeTileZ: tileZ
+                    )
+                )
+                appendCachedObstacle(
+                    entity: entity,
+                    coordinate: coordinate,
+                    state: &state
+                )
+            } else if obstacleMetrics(for: entity) != nil {
+                appendCachedObstacle(
+                    entity: entity,
+                    coordinate: coordinate,
+                    state: &state
+                )
+                if entity.name == "Resource Health Bar" {
+                    registerHealthBar(entity, state: &state)
+                }
+            }
+            for child in entity.children {
+                walk(child)
+            }
+        }
+        walk(tile)
+    }
+
+    private func unregisterTileContents(
+        tile: Entity,
+        coordinate: SurfaceTileCoordinate,
+        state: inout SurfaceExplorationState
+    ) {
+        var barsToRemove = Set<ObjectIdentifier>()
+        func collectBars(_ entity: Entity) {
+            if entity.name == "Resource Health Bar" {
+                barsToRemove.insert(ObjectIdentifier(entity))
+            }
+            for child in entity.children {
+                collectBars(child)
+            }
+        }
+        collectBars(tile)
+        state.healthBarEntities.removeAll {
+            barsToRemove.contains(ObjectIdentifier($0))
+        }
+        state.trackedCreatures.removeAll {
+            $0.tileCoordinate == coordinate
+        }
+        state.trackedRobots.removeAll {
+            $0.tileCoordinate == coordinate
+        }
+        state.cachedObstacles.removeAll {
+            $0.tileCoordinate == coordinate
+        }
+    }
+
+    private func rebuildTileObstacles(
+        coordinate: SurfaceTileCoordinate,
+        state: inout SurfaceExplorationState
+    ) {
+        state.cachedObstacles.removeAll {
+            $0.tileCoordinate == coordinate
+        }
+        guard let tile = state.loadedTiles[coordinate] else { return }
+        func walk(_ entity: Entity) {
+            if entity.name.hasPrefix("Surface Security Robot|") {
+                appendCachedObstacle(
+                    entity: entity,
+                    coordinate: coordinate,
+                    state: &state
+                )
+            } else if obstacleMetrics(for: entity) != nil
+                && !entity.name.hasPrefix("Surface Creature|") {
+                appendCachedObstacle(
+                    entity: entity,
+                    coordinate: coordinate,
+                    state: &state
+                )
+            }
+            for child in entity.children {
+                walk(child)
+            }
+        }
+        walk(tile)
+    }
+
     private func surfaceBiomeColor(
         for kind: CelestialBodyKind
     ) -> UIColor {
@@ -3326,7 +4766,7 @@ final class UniverseStreamer {
             roughness: 0.90,
             isMetallic: false
         )
-        let treeCount = Int(surfacePerspectiveScale * 0.58)
+        let treeCount = surfaceTreesPerTile
         let trunkMesh = MeshResource.generateCylinder(
             height: 2.8,
             radius: 0.16
@@ -3409,9 +4849,9 @@ final class UniverseStreamer {
         random: inout UniverseRandom
     ) {
         let mesh = MeshResource.generateBox(
-            width: 0.32,
-            height: 1.8,
-            depth: 0.32
+            width: 0.38,
+            height: 1.35,
+            depth: 0.55
         )
         for index in 0..<count {
             let x =
@@ -3437,25 +4877,34 @@ final class UniverseStreamer {
                 z: z,
                 state: state
             )
-            let materialName = mineralMaterialName(
-                for: state.body,
-                random: &random
-            )
-            let depositTier = random.int(in: 0...4)
+            let spawnRelic =
+                random.float(in: 0...1)
+                    < ProgressionEconomy.relicSpawnChancePerTile
+                    && index == 0
+            let materialName =
+                spawnRelic
+                    ? "Relic Cache"
+                    : mineralMaterialName(
+                        for: state.body,
+                        random: &random
+                    )
+            let depositTier = spawnRelic ? 3 : random.int(in: 0...4)
             let resourceIdentifier = surfaceResourceIdentifier(
                 worldIdentifier: state.worldIdentifier,
                 coordinate: coordinate,
-                category: "mineral",
+                category: spawnRelic ? "relic" : "mineral",
                 index: index
             )
             guard !surfaceResources.contains(resourceIdentifier) else {
                 continue
             }
             let material = SimpleMaterial(
-                color: mineralMaterialColor(
-                    for: state.body.kind,
-                    materialName: materialName
-                ),
+                color: spawnRelic
+                    ? .systemYellow
+                    : mineralMaterialColor(
+                        for: state.body.kind,
+                        materialName: materialName
+                    ),
                 roughness: 0.28,
                 isMetallic: true
             )
@@ -3463,20 +4912,22 @@ final class UniverseStreamer {
             formation.name =
                 "Collectible Mineral|\(materialName)"
                 + "|\(resourceIdentifier)|\(depositTier)"
+                + (spawnRelic ? "|relic" : "")
             let terrainElevation =
                 state.body.hasAtmosphere ? expandedBiomeElevation : 0
+            // Slight sink so crystals read as growing out of the soil.
             formation.position =
                 direction * (
                     state.effectiveRadius
-                        + terrainElevation
+                        + terrainElevation - 0.04
                 )
             formation.orientation = simd_quatf(
                 from: SIMD3<Float>(0, 1, 0),
                 to: direction
             )
             let shardCounts = [2, 3, 4, 5, 7]
-            let lengthScales: [Float] = [0.48, 0.72, 0.96, 1.26, 1.62]
-            let thicknessScales: [Float] = [0.70, 0.84, 1, 1.18, 1.38]
+            let lengthScales: [Float] = [0.48, 0.66, 0.84, 1.05, 1.28]
+            let thicknessScales: [Float] = [0.78, 0.90, 1.02, 1.16, 1.32]
             let shardCount = shardCounts[depositTier]
             let baseLength = lengthScales[depositTier]
             let thickness = thicknessScales[depositTier]
@@ -3495,6 +4946,8 @@ final class UniverseStreamer {
                     baseLength * lengthVariation,
                     thickness
                 ]
+                // Lie on the back with the center at the terrain plane so
+                // only the upper half (~0.2–0.55 m) sticks out of the ground.
                 shard.position = [
                     centeredIndex * 0.22 * thickness,
                     0,
@@ -3502,8 +4955,6 @@ final class UniverseStreamer {
                 ]
                 let fanAngle =
                     centeredIndex * (0.16 + Float(depositTier) * 0.018)
-                // Each crystal lies on its back with its center at the
-                // terrain plane, leaving the upper half visible.
                 shard.orientation =
                     simd_quatf(angle: fanAngle, axis: [0, 1, 0])
                     * simd_quatf(angle: .pi / 2, axis: [1, 0, 0])
@@ -3693,7 +5144,7 @@ final class UniverseStreamer {
             updateResourceHealthBar(
                 on: creature,
                 fraction: 1,
-                height: 2.25
+                height: resourceHealthBarLocalHeight(for: creature)
             )
             tile.addChild(creature)
         }
@@ -4063,41 +5514,32 @@ final class UniverseStreamer {
     }
 
     private func updateSurfaceSecurityRobots(
-        in root: Entity,
         toward playerSurfacePoint: SIMD3<Float>,
-        state: SurfaceExplorationState
+        state: inout SurfaceExplorationState
     ) {
-        var robots: [Entity] = []
-        func collect(from entity: Entity) {
-            if entity.name.hasPrefix("Surface Security Robot|") {
-                robots.append(entity)
-            }
-            for child in entity.children {
-                collect(from: child)
-            }
-        }
-        collect(from: root)
-
-        let playerX = simd_dot(playerSurfacePoint, state.tangentRight)
-        let playerZ = simd_dot(playerSurfacePoint, state.tangentForward)
-        for robot in robots {
-            let components = robot.name.split(separator: "|")
-            guard components.count >= 3,
-                  let tileX = Float(components[1]),
-                  let tileZ = Float(components[2]) else {
-                continue
-            }
-            let position = robot.position(relativeTo: root)
-            let robotX = simd_dot(position, state.tangentRight)
-            let robotZ = simd_dot(position, state.tangentForward)
+        let root = state.root
+        let playerPlanar = planarCoordinates(
+            forSurfacePoint: playerSurfacePoint,
+            state: state
+        )
+        let playerX = Float(playerPlanar.x)
+        let playerZ = Float(playerPlanar.y)
+        for tracked in state.trackedRobots {
+            let robot = tracked.entity
+            let robotPlanar = planarCoordinates(
+                forSurfacePoint: robot.position(relativeTo: root),
+                state: state
+            )
+            let robotX = Float(robotPlanar.x)
+            let robotZ = Float(robotPlanar.y)
             let toPlayer = SIMD2<Float>(
                 playerX - robotX,
                 playerZ - robotZ
             )
             let distance = simd_length(toPlayer)
             let home = SIMD2<Float>(
-                tileX * surfaceTileSize,
-                tileZ * surfaceTileSize
+                tracked.homeTileX * surfaceTileSize,
+                tracked.homeTileZ * surfaceTileSize
             )
             let distanceFromHome = simd_length(
                 SIMD2<Float>(robotX, robotZ) - home
@@ -4126,111 +5568,55 @@ final class UniverseStreamer {
                 ),
                 relativeTo: root
             )
+            let identifier = obstacleIdentifier(for: robot)
+            if let index = state.cachedObstacles.firstIndex(
+                where: { $0.identifier == identifier }
+            ) {
+                state.cachedObstacles[index].center = obstacleCenter(
+                    for: robot,
+                    state: state
+                )
+            }
         }
     }
 
     private func updateSurfaceCreatures(
-        in root: Entity,
         toward playerSurfacePoint: SIMD3<Float>,
         deltaTime: Float,
         state: inout SurfaceExplorationState
     ) {
-        var creatures: [Entity] = []
-        func collect(from entity: Entity) {
-            if entity.name.hasPrefix("Surface Creature|") {
-                creatures.append(entity)
-            }
-            for child in entity.children {
-                collect(from: child)
-            }
-        }
-        collect(from: root)
+        let root = state.root
+        // Live scene walk keeps tree avoidance correct even if the tile
+        // obstacle cache is stale after streaming or resource depletion.
+        let obstacles = collectSurfaceObstacles(in: root, state: state)
 
-        var obstacles: [CreatureObstacle] = []
-        func collectObstacles(from entity: Entity) {
-            guard entity.isEnabled else { return }
-            let radius: Float?
-            let height: Float
-            if entity.name.hasPrefix("Surface Forest Tree|") {
-                radius = 1.55 * max(entity.scale.x, entity.scale.z)
-                height = 3.1 * entity.scale.y
-            } else if entity.name.hasPrefix("Collectible Mineral|") {
-                let tier = mineralDepositTier(encodedIn: entity.name)
-                radius = 0.72 + Float(tier) * 0.19
-                height = 0.84 + Float(tier) * 0.16
-            } else if entity.name.hasPrefix("Loose Mineral|")
-                || entity.name.hasPrefix("Loose Electronic|")
-                || entity.name.hasPrefix("Loose Log|")
-                || entity.name.hasPrefix("Loose Creature Material|")
-                || entity.name.hasPrefix("Step Surface|") {
-                radius = 0.62
-                height = 0.64
-            } else if entity.name == "Surface Base" {
-                radius = 4.6
-                height = 2.8
-            } else if entity.name.hasPrefix("Surface Security Robot|") {
-                radius = 0.72
-                height = 1.64
-            } else if entity.name == "Landed Ship" {
-                radius = 2.5
-                height = 2.2
-            } else if entity.name == "Parked Rover" {
-                radius = 1.35
-                height = 1.3
-            } else {
-                radius = nil
-                height = 0
-            }
-            if let radius {
-                let position = entity.position(relativeTo: root)
-                obstacles.append(
-                    CreatureObstacle(
-                        identifier:
-                            entity.name
-                            + "|"
-                            + String(describing: ObjectIdentifier(entity)),
-                        center: SIMD2<Double>(
-                            Double(simd_dot(position, state.tangentRight)),
-                            Double(simd_dot(position, state.tangentForward))
-                        ),
-                        radius: Double(radius),
-                        height: Double(height)
-                    )
-                )
-                return
-            }
-            for child in entity.children {
-                collectObstacles(from: child)
-            }
-        }
-        collectObstacles(from: root)
-
-        let playerX = Double(simd_dot(
-            playerSurfacePoint,
-            state.tangentRight
-        ))
-        let playerZ = Double(simd_dot(
-            playerSurfacePoint,
-            state.tangentForward
-        ))
+        let playerPlanar = planarCoordinates(
+            forSurfacePoint: playerSurfacePoint,
+            state: state
+        )
+        let playerX = playerPlanar.x
+        let playerZ = playerPlanar.y
         let paceSeed = state.worldIdentifier.utf8.reduce(UInt64(0)) {
             (($0 &* 1099511628211) ^ UInt64($1))
         }
         let planetPace =
             0.5 + Float(paceSeed % 1_501) / 1_000
         let attackInterval = 1 / planetPace
-        for creature in creatures {
-            let components = creature.name.split(separator: "|")
-            guard components.count >= 9,
-                  let homeX = Float(components[2]),
-                  let homeZ = Float(components[3]),
-                  let heading = Float(components[4]),
-                  let speed = Float(components[5]),
-                  let phase = Float(components[6]) else {
+        var deadCreatureKeys: [Entity] = []
+        for tracked in state.trackedCreatures {
+            let creature = tracked.entity
+            guard creature.parent != nil else {
+                deadCreatureKeys.append(creature)
                 continue
             }
-            let isAggressive = components[1] == "1"
-            let isWinged = components[8] != "none"
+            let homeX = tracked.homeX
+            let homeZ = tracked.homeZ
+            let heading = tracked.baseHeading
+            let speed = tracked.moveSpeed
+            let phase = tracked.phase
+            let isAggressive = tracked.isAggressive
+            let isWinged = tracked.isWinged
+            let stateKey = tracked.stateKey
             let flightCycle = (
                 state.wildlifeAnimationTime + phase * 4
             ).truncatingRemainder(dividingBy: 44)
@@ -4252,7 +5638,6 @@ final class UniverseStreamer {
             let renderedPosition = creature.position(relativeTo: root)
             let surfaceRadius =
                 state.effectiveRadius + expandedBiomeElevation
-            let stateKey = creature.name
             var runtime = state.creatureStates[stateKey]
                 ?? CreatureRuntimeState(
                     position: SIMD2<Double>(
@@ -4272,6 +5657,7 @@ final class UniverseStreamer {
                 )
             if runtime.health <= 0 {
                 creature.removeFromParent()
+                deadCreatureKeys.append(creature)
                 continue
             }
             runtime.stunRemaining = max(
@@ -4313,8 +5699,10 @@ final class UniverseStreamer {
             let normalHabitatRadius: Double = isWinged ? 12 : 9
             let aggressionRange: Double = isWinged ? 42 : 30
             let pursuitLeash: Double = 30
-            let attackEnterDistance: Double = 0.95
-            let attackExitDistance: Double = 1.65
+            let attackEnterDistance: Double = 1.35
+            let attackExitDistance: Double = 2.25
+            let attackEnterDistance3D: Float = 2.4
+            let attackExitDistance3D: Float = 3.4
             let playerAltitude = max(
                 0,
                 Double(simd_length(playerSurfacePoint) - surfaceRadius)
@@ -4326,13 +5714,24 @@ final class UniverseStreamer {
                 isWinged ? max(0, playerAltitude - 0.75) : 0
             let verticalSeparation =
                 abs(runtime.altitude - attackAltitude)
-            let isAtAttackHeight = verticalSeparation <= 0.55
+            let isAtAttackHeight = verticalSeparation <= 0.85
+            let creatureSurfacePoint = renderedPosition
+            let distance3D = simd_length(
+                creatureSurfacePoint - playerSurfacePoint
+            )
+            let inMeleeRange =
+                (playerDistance <= attackEnterDistance
+                    && isAtAttackHeight)
+                || (distance3D <= attackEnterDistance3D
+                    && isAtAttackHeight)
+            let leftMeleeRange =
+                playerDistance > attackExitDistance
+                && distance3D > attackExitDistance3D
 
             if isAggressive && !isStunned && !isRetreating {
                 switch runtime.behavior {
                 case .attacking:
-                    if playerDistance > attackExitDistance
-                        || !isAtAttackHeight {
+                    if leftMeleeRange || !isAtAttackHeight {
                         runtime.behavior =
                             playerDistance < aggressionRange
                                 && homeDistance < pursuitLeash
@@ -4340,8 +5739,7 @@ final class UniverseStreamer {
                                 : .returningHome
                     }
                 case .pursuing:
-                    if playerDistance <= attackEnterDistance
-                        && isAtAttackHeight {
+                    if inMeleeRange {
                         runtime.behavior = .attacking
                     } else if playerDistance >= aggressionRange
                         || homeDistance >= pursuitLeash {
@@ -4709,9 +6107,7 @@ final class UniverseStreamer {
                 relativeTo: root
             )
             state.creatureStates[stateKey] = runtime
-            if let flash = creature.findEntity(
-                named: "Creature Hit Flash"
-            ) {
+            if let flash = tracked.hitFlash {
                 let impactVisible =
                     runtime.impactFlashRemaining > 0
                         && Int(
@@ -4731,7 +6127,7 @@ final class UniverseStreamer {
             let isLocomoting = appliedHorizontalStep > 0.000_001
             let isDescending = isFlying && verticalStep < -0.000_001
             let shouldFlapWings = isFlying && !isDescending
-            if let body = creature.findEntity(named: "Creature Body") {
+            if let body = tracked.bodyEntity {
                 let restingHeight: Float =
                     body.scale.y > 1
                         ? 1.02
@@ -4848,73 +6244,469 @@ final class UniverseStreamer {
                 )
             }
         }
+        for entity in deadCreatureKeys {
+            removeTrackedCreature(for: entity, state: &state)
+        }
     }
 
     private func addRoughSurfaceDetail(
         to roughRoot: Entity,
         for body: CelestialBodyDescriptor
     ) {
-        let patchColor: UIColor = switch body.kind {
-        case .ocean:
-            UIColor(red: 0.12, green: 0.34, blue: 0.12, alpha: 1)
-        case .desert:
-            UIColor(red: 0.42, green: 0.16, blue: 0.055, alpha: 1)
-        case .rocky:
-            UIColor(white: 0.22, alpha: 1)
-        case .ice:
-            UIColor(red: 0.72, green: 0.88, blue: 0.93, alpha: 1)
-        case .gas:
-            UIColor(red: 0.34, green: 0.18, blue: 0.48, alpha: 1)
-        case .star:
-            .clear
-        }
-        let patchMaterial = SimpleMaterial(
-            color: patchColor,
-            roughness: 0.94,
-            isMetallic: false
+        var random = UniverseRandom(
+            seed: body.name.utf8.reduce(UInt64(0xC0A5_71A1)) {
+                ($0 &* 1_099_511_628_211) ^ UInt64($1)
+            }
         )
-        let patchMesh = MeshResource.generateSphere(radius: 1)
-        let phase = Float(body.name.utf8.reduce(0) { ($0 + UInt64($1)) % 10_000 })
-            * 0.013
+        let biomes = orbitalBiomePalette(for: body.kind)
+        guard !biomes.isEmpty else { return }
 
-        for index in 0..<18 {
-            let direction = surfaceDirection(
-                index: index,
-                count: 18,
-                phase: phase
+        // All non-star worlds use the same raised unlit mosaic so orbital
+        // biome definition remains visible from tens of kilometers away.
+        addNoiseMaskedOrbitalBiomes(
+            to: roughRoot,
+            body: body,
+            biomes: biomes,
+            random: &random
+        )
+    }
+
+    private struct OrbitalBiomeStyle {
+        let name: String
+        let color: UIColor
+        let elevationScale: Float
+    }
+
+    private func orbitalBiomePalette(
+        for kind: CelestialBodyKind
+    ) -> [OrbitalBiomeStyle] {
+        switch kind {
+        case .ocean:
+            [
+                OrbitalBiomeStyle(
+                    name: "Forest Continent",
+                    color: UIColor(red: 0.08, green: 0.55, blue: 0.14, alpha: 1),
+                    elevationScale: 0.0065
+                ),
+                OrbitalBiomeStyle(
+                    name: "Coastal Plains",
+                    color: UIColor(red: 0.72, green: 0.62, blue: 0.28, alpha: 1),
+                    elevationScale: 0.004
+                ),
+                OrbitalBiomeStyle(
+                    name: "Highland Jungle",
+                    color: UIColor(red: 0.02, green: 0.36, blue: 0.10, alpha: 1),
+                    elevationScale: 0.008
+                ),
+                OrbitalBiomeStyle(
+                    name: "Mountain Spine",
+                    color: UIColor(red: 0.48, green: 0.45, blue: 0.40, alpha: 1),
+                    elevationScale: 0.013
+                )
+            ]
+        case .desert:
+            [
+                OrbitalBiomeStyle(
+                    name: "Dune Sea",
+                    color: UIColor(red: 0.78, green: 0.52, blue: 0.22, alpha: 1),
+                    elevationScale: 0.005
+                ),
+                OrbitalBiomeStyle(
+                    name: "Red Mesa",
+                    color: UIColor(red: 0.52, green: 0.18, blue: 0.08, alpha: 1),
+                    elevationScale: 0.010
+                ),
+                OrbitalBiomeStyle(
+                    name: "Canyon Badlands",
+                    color: UIColor(red: 0.30, green: 0.10, blue: 0.05, alpha: 1),
+                    elevationScale: 0.009
+                ),
+                OrbitalBiomeStyle(
+                    name: "Oasis Belt",
+                    color: UIColor(red: 0.28, green: 0.42, blue: 0.16, alpha: 1),
+                    elevationScale: 0.0035
+                )
+            ]
+        case .rocky:
+            [
+                OrbitalBiomeStyle(
+                    name: "Basalt Highlands",
+                    color: UIColor(white: 0.34, alpha: 1),
+                    elevationScale: 0.011
+                ),
+                OrbitalBiomeStyle(
+                    name: "Crater Province",
+                    color: UIColor(white: 0.18, alpha: 1),
+                    elevationScale: 0.0045
+                ),
+                OrbitalBiomeStyle(
+                    name: "Mineral Ridge",
+                    color: UIColor(red: 0.42, green: 0.30, blue: 0.22, alpha: 1),
+                    elevationScale: 0.014
+                ),
+                OrbitalBiomeStyle(
+                    name: "Ash Plains",
+                    color: UIColor(white: 0.26, alpha: 1),
+                    elevationScale: 0.004
+                )
+            ]
+        case .ice:
+            [
+                OrbitalBiomeStyle(
+                    name: "Ice Shelf",
+                    color: UIColor(red: 0.78, green: 0.90, blue: 0.96, alpha: 1),
+                    elevationScale: 0.0045
+                ),
+                OrbitalBiomeStyle(
+                    name: "Glacier Range",
+                    color: UIColor(red: 0.62, green: 0.78, blue: 0.88, alpha: 1),
+                    elevationScale: 0.011
+                ),
+                OrbitalBiomeStyle(
+                    name: "Blue Crevasse Field",
+                    color: UIColor(red: 0.35, green: 0.58, blue: 0.78, alpha: 1),
+                    elevationScale: 0.007
+                ),
+                OrbitalBiomeStyle(
+                    name: "Frozen Tundra",
+                    color: UIColor(red: 0.55, green: 0.66, blue: 0.70, alpha: 1),
+                    elevationScale: 0.004
+                )
+            ]
+        case .gas:
+            [
+                OrbitalBiomeStyle(
+                    name: "Cloud Band",
+                    color: UIColor(red: 0.62, green: 0.42, blue: 0.78, alpha: 1),
+                    elevationScale: 0.0025
+                ),
+                OrbitalBiomeStyle(
+                    name: "Storm Belt",
+                    color: UIColor(red: 0.28, green: 0.12, blue: 0.42, alpha: 1),
+                    elevationScale: 0.0045
+                ),
+                OrbitalBiomeStyle(
+                    name: "Pale Zone",
+                    color: UIColor(red: 0.78, green: 0.68, blue: 0.88, alpha: 1),
+                    elevationScale: 0.0018
+                )
+            ]
+        case .star:
+            []
+        }
+    }
+
+    private func orbitalBaseColor(for kind: CelestialBodyKind) -> UIColor {
+        switch kind {
+        case .star:
+            .systemYellow
+        case .ocean:
+            UIColor(red: 0.05, green: 0.18, blue: 0.42, alpha: 1)
+        case .desert:
+            UIColor(red: 0.62, green: 0.38, blue: 0.16, alpha: 1)
+        case .rocky:
+            UIColor(red: 0.40, green: 0.38, blue: 0.36, alpha: 1)
+        case .ice:
+            UIColor(red: 0.70, green: 0.82, blue: 0.90, alpha: 1)
+        case .gas:
+            UIColor(red: 0.42, green: 0.28, blue: 0.55, alpha: 1)
+        }
+    }
+
+    private func atmosphereLimbColor(for kind: CelestialBodyKind) -> UIColor {
+        switch kind {
+        case .star:
+            .white
+        case .ocean:
+            UIColor(red: 0.45, green: 0.70, blue: 1.0, alpha: 1)
+        case .desert:
+            UIColor(red: 1.0, green: 0.72, blue: 0.42, alpha: 1)
+        case .rocky:
+            UIColor(red: 0.75, green: 0.80, blue: 0.90, alpha: 1)
+        case .ice:
+            UIColor(red: 0.70, green: 0.88, blue: 1.0, alpha: 1)
+        case .gas:
+            UIColor(red: 0.78, green: 0.58, blue: 0.95, alpha: 1)
+        }
+    }
+
+    private func addNoiseMaskedOrbitalBiomes(
+        to root: Entity,
+        body: CelestialBodyDescriptor,
+        biomes: [OrbitalBiomeStyle],
+        random: inout UniverseRandom
+    ) {
+        let seedA = random.float(in: 0...100)
+        let seedB = random.float(in: 0...100)
+        let seedC = random.float(in: 0...100)
+        let landThreshold: Float = switch body.kind {
+        case .ocean: -0.05
+        case .desert: -0.12
+        case .rocky: -0.22
+        case .ice: -0.08
+        case .gas: -1
+        case .star: 1
+        }
+
+        // Land tiles only — oceans come from the opaque core sphere so the
+        // far side of the planet is never visible through "empty" water.
+        let shellRadius = body.radius * 1.012
+        let latSteps = 28
+        let lonSteps = 56
+        let thickness = max(body.radius * 0.01, 1.6)
+
+        func direction(lat: Float, lon: Float) -> SIMD3<Float> {
+            let ring = cos(lat)
+            return simd_normalize(
+                SIMD3<Float>(
+                    cos(lon) * ring,
+                    sin(lat),
+                    sin(lon) * ring
+                )
             )
-            let width = body.radius * (0.055 + Float(index % 4) * 0.014)
-            let elevationScale: Float = switch body.kind {
-            case .ocean: 0.004
-            case .desert: 0.009
-            case .rocky: 0.012
-            case .ice: 0.007
-            case .gas: 0.002
-            case .star: 0
+        }
+
+        func landField(_ dir: SIMD3<Float>) -> Float {
+            let n1 = sin(dir.x * 2.4 + seedA) * cos(dir.z * 2.1 - seedB)
+            let n2 = sin(dir.y * 3.3 + dir.x * 1.7 + seedC)
+            let n3 = cos((dir.x + dir.z) * 4.8 - seedA * 0.7)
+            let n4 = sin(dir.x * 7.1 - dir.y * 5.4 + seedB)
+                * cos(dir.z * 6.2 + seedC)
+            let n5 = sin(
+                (dir.x * 0.9 + dir.z * 1.3) * 1.4 + seedA * 0.3
+            )
+            return n1 * 0.34 + n2 * 0.24 + n3 * 0.18 + n4 * 0.14 + n5 * 0.20
+        }
+
+        func biomeIndex(for dir: SIMD3<Float>, land: Float) -> Int {
+            let climate =
+                sin(dir.y * 2.8 + seedB)
+                + cos(dir.x * 3.1 - dir.z * 2.2 + seedC) * 0.65
+                + land * 0.45
+            let normalized = (climate + 2.1) / 4.2
+            let scaled = max(0, min(0.999, normalized)) * Float(biomes.count)
+            return min(biomes.count - 1, Int(scaled))
+        }
+
+        for latIndex in 0..<latSteps {
+            let lat0 =
+                -Float.pi / 2
+                + Float.pi * Float(latIndex) / Float(latSteps)
+            let lat1 =
+                -Float.pi / 2
+                + Float.pi * Float(latIndex + 1) / Float(latSteps)
+            let latMid = 0.5 * (lat0 + lat1)
+            for lonIndex in 0..<lonSteps {
+                let lon0 =
+                    -Float.pi
+                    + 2 * Float.pi * Float(lonIndex) / Float(lonSteps)
+                let lon1 =
+                    -Float.pi
+                    + 2 * Float.pi * Float(lonIndex + 1) / Float(lonSteps)
+                let lonMid = 0.5 * (lon0 + lon1)
+                let mid = direction(lat: latMid, lon: lonMid)
+                let land = landField(mid)
+
+                let color: UIColor
+                let name: String
+                if body.kind == .gas {
+                    let band = biomes[
+                        abs(Int((mid.y + 1) * 4 + land * 2)) % biomes.count
+                    ]
+                    color = band.color
+                    name = "GlobeV5 \(band.name)"
+                } else if land > landThreshold {
+                    let biome = biomes[biomeIndex(for: mid, land: land)]
+                    color = biome.color
+                    name = "GlobeV5 \(biome.name)"
+                } else {
+                    continue
+                }
+
+                let latSpan = abs(lat1 - lat0)
+                let lonSpan = abs(lon1 - lon0)
+                let width = max(
+                    shellRadius * lonSpan * max(0.18, abs(cos(latMid))) * 1.06,
+                    body.radius * 0.015
+                )
+                let height = max(
+                    shellRadius * latSpan * 1.06,
+                    body.radius * 0.015
+                )
+                let tile = ModelEntity(
+                    mesh: .generateBox(
+                        width: width,
+                        height: thickness,
+                        depth: height
+                    ),
+                    materials: [
+                        UnlitMaterial(color: color)
+                    ]
+                )
+                tile.name = name
+                tile.position = mid * shellRadius
+                tile.orientation = simd_quatf(
+                    from: SIMD3<Float>(0, 1, 0),
+                    to: mid
+                )
+                root.addChild(tile)
             }
+        }
+    }
+
+    private func addIrregularContinentPatch(
+        to root: Entity,
+        body: CelestialBodyDescriptor,
+        center: SIMD3<Float>,
+        meanAngularRadius: Float,
+        biome: OrbitalBiomeStyle,
+        segmentCount: Int,
+        random: inout UniverseRandom,
+        name: String
+    ) {
+        // Kept for airless highland accents; orbital biomes now use the
+        // noise-masked grid so Earth-like worlds no longer read as ovals.
+        let normal = simd_normalize(center)
+        let reference =
+            abs(normal.y) < 0.92
+                ? SIMD3<Float>(0, 1, 0)
+                : SIMD3<Float>(1, 0, 0)
+        let right = simd_normalize(simd_cross(reference, normal))
+        let forward = simd_normalize(simd_cross(normal, right))
+        let phaseA = random.float(in: 0...(2 * .pi))
+        let phaseB = random.float(in: 0...(2 * .pi))
+        let lobeCount = random.int(in: 3...6)
+
+        var positions: [SIMD3<Float>] = []
+        var normals: [SIMD3<Float>] = []
+        var indices: [UInt32] = []
+        let elevation =
+            body.radius
+            * (biome.elevationScale + random.float(in: 0...0.0025))
+        let surfaceRadius = body.radius + elevation
+
+        positions.append(normal * surfaceRadius)
+        normals.append(normal)
+
+        for segment in 0..<segmentCount {
+            let angle =
+                Float(segment) / Float(segmentCount) * 2 * .pi
+            let lobe =
+                0.40
+                + 0.60
+                * abs(sin(Float(lobeCount) * 0.5 * angle + phaseA))
+            let fjordWave = sin(angle * 11 + phaseB)
+            let fjordCut: Float = fjordWave > 0.55 ? 0.22 : 1
+            let warp =
+                0.30 * sin(angle * 2 + phaseA)
+                + 0.22 * sin(angle * 5 - phaseB)
+                + 0.16 * cos(angle * 8 + phaseA * 0.4)
+            let extent = max(
+                0.04,
+                meanAngularRadius * lobe * fjordCut * (0.70 + warp)
+            )
+            let direction = simd_normalize(
+                normal * cos(extent)
+                    + right * (cos(angle) * sin(extent))
+                    + forward * (sin(angle) * sin(extent))
+            )
+            positions.append(direction * surfaceRadius)
+            normals.append(direction)
+        }
+
+        for segment in 0..<segmentCount {
+            let current = UInt32(1 + segment)
+            let next = UInt32(1 + (segment + 1) % segmentCount)
+            indices.append(contentsOf: [0, current, next, 0, next, current])
+        }
+
+        var descriptor = MeshDescriptor(name: name)
+        descriptor.positions = MeshBuffers.Positions(positions)
+        descriptor.normals = MeshBuffers.Normals(normals)
+        descriptor.primitives = .triangles(indices)
+        guard let mesh = try? MeshResource.generate(from: [descriptor]) else {
+            return
+        }
+        let continent = ModelEntity(
+            mesh: mesh,
+            materials: [UnlitMaterial(color: biome.color)]
+        )
+        continent.name = name
+        root.addChild(continent)
+    }
+
+    private func addOrbitalCloudBands(
+        to root: Entity,
+        body: CelestialBodyDescriptor,
+        biomes: [OrbitalBiomeStyle],
+        random: inout UniverseRandom
+    ) {
+        guard !biomes.isEmpty else { return }
+        let bandCount = random.int(in: 6...9)
+        for index in 0..<bandCount {
+            let biome = biomes[index % biomes.count]
+            let latitude = random.float(in: -0.82...0.82)
+            let halfWidth = random.float(in: 0.06...0.14)
+            let segmentCount = 48
+            var positions: [SIMD3<Float>] = []
+            var normals: [SIMD3<Float>] = []
+            var indices: [UInt32] = []
             let elevation =
-                body.radius * (elevationScale + Float(index % 3) * 0.002)
-            let patch = ModelEntity(
-                mesh: patchMesh,
-                materials: [patchMaterial]
-            )
-            patch.name = switch body.kind {
-            case .ocean: "Forest Continent"
-            case .desert: "Dune Highlands"
-            case .rocky: "Rocky Highlands"
-            case .ice: "Ice Shelf"
-            case .gas: "Cloud Formation"
-            case .star: "Surface Feature"
+                body.radius * (biome.elevationScale + Float(index % 3) * 0.0008)
+            let surfaceRadius = body.radius + elevation
+
+            for segment in 0..<segmentCount {
+                let angle =
+                    Float(segment) / Float(segmentCount) * 2 * .pi
+                let edgeWarp =
+                    0.35 * sin(angle * 3 + Float(index))
+                    + 0.20 * cos(angle * 5 - Float(index) * 0.7)
+                for edge in 0..<2 {
+                    let lat =
+                        latitude
+                        + (edge == 0 ? -halfWidth : halfWidth)
+                        * (1 + 0.45 * edgeWarp)
+                    let ring = sqrt(max(0.05, 1 - lat * lat))
+                    let direction = simd_normalize(
+                        SIMD3<Float>(
+                            cos(angle) * ring,
+                            lat,
+                            sin(angle) * ring
+                        )
+                    )
+                    positions.append(direction * surfaceRadius)
+                    normals.append(direction)
+                }
             }
-            // Sink the flattened terrain volume into the curved planet so its
-            // perimeter never reads as a floating plate.
-            patch.position = direction * (body.radius - elevation * 0.35)
-            patch.orientation = simd_quatf(
-                from: SIMD3<Float>(0, 1, 0),
-                to: direction
+
+            for segment in 0..<segmentCount {
+                let next = (segment + 1) % segmentCount
+                let a = UInt32(segment * 2)
+                let b = a + 1
+                let c = UInt32(next * 2)
+                let d = c + 1
+                indices.append(contentsOf: [a, c, b, c, d, b, a, b, c, c, b, d])
+            }
+
+            var descriptor = MeshDescriptor(name: "\(biome.name) \(index + 1)")
+            descriptor.positions = MeshBuffers.Positions(positions)
+            descriptor.normals = MeshBuffers.Normals(normals)
+            descriptor.primitives = .triangles(indices)
+            guard let mesh = try? MeshResource.generate(from: [descriptor]) else {
+                continue
+            }
+            let band = ModelEntity(
+                mesh: mesh,
+                materials: [
+                    SimpleMaterial(
+                        color: biome.color,
+                        roughness: 0.88,
+                        isMetallic: false
+                    )
+                ]
             )
-            patch.scale = [width, elevation, width * 0.72]
-            roughRoot.addChild(patch)
+            band.name = "\(biome.name) \(index + 1)"
+            root.addChild(band)
         }
     }
 
@@ -4922,6 +6714,26 @@ final class UniverseStreamer {
         to root: Entity,
         for body: CelestialBodyDescriptor
     ) {
+        var random = UniverseRandom(
+            seed: body.name.utf8.reduce(UInt64(0xA1A1_E55)) {
+                ($0 &* 1_099_511_628_211) ^ UInt64($1)
+            }
+        )
+        let biomes = orbitalBiomePalette(for: .rocky)
+        for index in 0..<6 {
+            let biome = biomes[index % biomes.count]
+            addIrregularContinentPatch(
+                to: root,
+                body: body,
+                center: random.unitVector(),
+                meanAngularRadius: random.float(in: 0.18...0.42),
+                biome: biome,
+                segmentCount: 32,
+                random: &random,
+                name: "\(biome.name) Mask \(index + 1)"
+            )
+        }
+
         let phase = Float(body.name.utf8.reduce(0) {
             ($0 + UInt64($1)) % 10_000
         }) * 0.013
@@ -5618,14 +7430,7 @@ final class UniverseStreamer {
     }
 
     private func color(for kind: CelestialBodyKind) -> UIColor {
-        switch kind {
-        case .star: .systemYellow
-        case .ocean: .systemBlue
-        case .desert: .systemOrange
-        case .rocky: .lightGray
-        case .ice: .systemCyan
-        case .gas: .systemPurple
-        }
+        orbitalBaseColor(for: kind)
     }
 }
 
@@ -5663,5 +7468,10 @@ private struct UniverseRandom {
         let angle = float(in: 0...(2 * .pi))
         let radius = sqrt(max(0, 1 - z * z))
         return SIMD3<Float>(radius * cos(angle), radius * sin(angle), z)
+    }
+
+    mutating func unitVectorDouble() -> SIMD3<Double> {
+        let v = unitVector()
+        return SIMD3<Double>(Double(v.x), Double(v.y), Double(v.z))
     }
 }

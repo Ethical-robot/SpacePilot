@@ -1,0 +1,17 @@
+---
+description: Keep CONTROLS.md current whenever hand, gamepad, HUD, or window bindings change
+globs: SpacePilot/HandFlightController.swift,SpacePilot/ImmersiveSpaceView.swift,SpacePilot/MissionControlView.swift,SpacePilot/FlightModel.swift,CONTROLS.md
+alwaysApply: false
+---
+
+# Controls documentation
+
+[CONTROLS.md](CONTROLS.md) is the living inventory of all player gestures and controls.
+
+When you add, remove, rename, or rebind any hand gesture, gamepad input, cockpit/HUD button, or Mission Control window control:
+
+1. Update the implementation.
+2. Update `CONTROLS.md` in the same change (matching section tables).
+3. Do not leave stale bindings in the doc.
+
+Primary code sources: `HandFlightController.swift`, `ControllerObserver` in `ImmersiveSpaceView.swift`, `MissionControlView.swift`, related `FlightModel` entry points.

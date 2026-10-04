@@ -28,10 +28,59 @@ enum ShipWeapon: String, CaseIterable, Sendable {
 
 enum SurfaceTool: String, CaseIterable, Sendable {
     case empty = "EMPTY"
+    case axe = "AXE"
     case sonicSlicer = "SONIC SLICER"
     case matterCrumbler = "MATTER CRUMBLER"
     case matterLauncher = "MATTER LAUNCHER"
     case analyzer = "ANALYZER"
+
+    var rawIndex: Int {
+        Self.allCases.firstIndex(of: self) ?? 0
+    }
+
+    var usesOrganicEnergy: Bool {
+        switch self {
+        case .empty, .axe: false
+        case .sonicSlicer, .matterCrumbler, .matterLauncher, .analyzer:
+            true
+        }
+    }
+}
+
+enum GameDifficulty: String, CaseIterable, Codable, Sendable {
+    case creative = "Creative"
+    case normal = "Normal"
+    case survivor = "Survivor"
+
+    var detail: String {
+        switch self {
+        case .creative:
+            "Damage feedback only — no real damage. All tools unlocked. No energy/fuel costs."
+        case .normal:
+            "Basic tools, standard damage. Reduced energy and fuel costs."
+        case .survivor:
+            "Start with Axe only. Powered tools and flight burn organics/fuel. Find Mon (§), craft, trade, and chase Relics."
+        }
+    }
+}
+
+enum DominantHandSetting: String, CaseIterable, Codable, Sendable {
+    case right = "RIGHT"
+    case left = "LEFT"
+}
+
+private struct PlayerSettingsSnapshot: Codable {
+    var shipDominantHand: String
+    var walkingDominantHand: String
+    var roverDominantHand: String
+    var difficulty: String
+}
+
+enum SettingsResetPrompt: Equatable, Sendable {
+    /// Wipe progress, move to start, pick difficulty.
+    case fullReset
+    /// Testing only: keep inventory/credits, relocate, pick difficulty.
+    case worldResetKeepStuff
 }
 
 struct TargetContact: Identifiable, Equatable, Sendable {
@@ -50,6 +99,12 @@ struct InventoryItem: Codable, Identifiable, Equatable, Sendable {
     let sourcePlanetKind: CelestialBodyKind
     var quantity: Int
     var processedElementName: String?
+    /// Relic fused with a key — can be opened at the ship/station.
+    var relicCanOpen: Bool?
+    var moduleID: String?
+    var blueprintID: String?
+    /// Single-use organic energy recharge when activated/consumed.
+    var energyRecharge: Float?
 
     var categoryLabel: String {
         switch category {
@@ -57,17 +112,51 @@ struct InventoryItem: Codable, Identifiable, Equatable, Sendable {
         case .mineral: "MINERAL"
         case .electronic: "ELECTRONIC"
         case .creatureMaterial: "CREATURE MATERIAL"
+        case .relic: "RELIC"
+        case .relicKey: "RELIC KEY"
+        case .element: "ELEMENT"
+        case .blueprint: "BLUEPRINT"
+        case .module: "MODULE"
         }
     }
 
     var displayName: String {
         processedElementName ?? materialName
     }
+
+    var isRelicKey: Bool { category == .relicKey }
+    var isRelic: Bool { category == .relic }
+    var isEnergyCube: Bool {
+        energyRecharge != nil && energyRecharge! > 0
+    }
 }
 
 private struct InventorySnapshot: Codable {
     let items: [InventoryItem]
     let equippedItemID: String?
+    let credits: Int?
+    var progression: ProgressionSnapshot?
+
+    init(
+        items: [InventoryItem],
+        equippedItemID: String?,
+        credits: Int,
+        progression: ProgressionSnapshot? = nil
+    ) {
+        self.items = items
+        self.equippedItemID = equippedItemID
+        self.credits = credits
+        self.progression = progression
+    }
+}
+
+struct StationTradeOffer: Identifiable, Equatable, Sendable {
+    let id: String
+    let item: InventoryItem
+    let origin: StationBuyOrigin
+    let unitPrice: Int
+
+    var totalPrice: Int { unitPrice * item.quantity }
 }
 
 private struct SavedGalacticPosition: Codable {
@@ -166,18 +255,30 @@ final class FlightModel {
     static let immersiveSpaceID = "SpaceFlight"
     private static let inventoryStorageKey = "SpacePilot.Inventory.v1"
     private static let locationStorageKey = "SpacePilot.Location.v1"
+    private static let creditsStorageKey = "SpacePilot.Credits.v1"
+    private static let settingsStorageKey = "SpacePilot.Settings.v1"
 
     var isImmersive = false
-    var throttle = 0.18
-    var pitchInput = 0.0
-    var yawInput = 0.0
-    var rollInput = 0.0
-    var strafeInputX = 0.0
-    var strafeInputY = 0.0
+    /// High-frequency stick/throttle inputs stay observation-ignored so hand
+    /// tracking does not invalidate SwiftUI HUD/window views every frame.
+    @ObservationIgnored var throttle = 0.18
+    @ObservationIgnored var pitchInput = 0.0
+    @ObservationIgnored var yawInput = 0.0
+    @ObservationIgnored var rollInput = 0.0
+    @ObservationIgnored var strafeInputX = 0.0
+    @ObservationIgnored var strafeInputY = 0.0
     var autopilot = false
-    var speed: Float = 0
-    var distanceTravelled: Float = 0
-    var elapsedTime: TimeInterval = 0
+    @ObservationIgnored private var simulationSpeed: Float = 0
+    var speed: Float {
+        get { simulationSpeed }
+        set { simulationSpeed = newValue }
+    }
+    @ObservationIgnored var distanceTravelled: Float = 0
+    @ObservationIgnored var elapsedTime: TimeInterval = 0
+    /// Throttled HUD mirror of `travelSpeed` (updated in `updateTelemetry`).
+    var displayedTravelSpeed: Float = 0
+    var displayedDistanceTravelled: Float = 0
+    var displayedElapsedTime: TimeInterval = 0
     var nearestObject = "Earth"
     var nearestDistance: Float = 0
     var currentRegion = "0, 0, 0"
@@ -198,7 +299,8 @@ final class FlightModel {
     var isHyperDriveCharging = false
     var hyperDriveCountdown: Double = 0
     var isAtmosphericBoostHeld = false
-    var atmosphericBoostBlend: Float = 0
+    @ObservationIgnored var atmosphericBoostBlend: Float = 0
+    var isAtmosphericBoostActive = false
     var isWithinPlanetAtmosphere = false
     var isDocked = false
     var isLanded = false
@@ -214,7 +316,7 @@ final class FlightModel {
     var environmentStatus = "SPACE"
     var altitudeAboveSurface: Float?
     var atmosphericSpeedLimit: Float?
-    var atmosphereHazeOpacity = 0.0
+    @ObservationIgnored var atmosphereHazeOpacity = 0.0
     var starHeat: Float = 0
     var isShipDestroyed = false
     var playerHealth: Float = 20
@@ -223,13 +325,16 @@ final class FlightModel {
     var shipShield: Float = 500
     var shipHull: Float = 1_000
     var isShipShieldActive = true
+    @ObservationIgnored private var simulationDamageFlashOpacity: Double = 0
     var damageFlashOpacity: Double = 0
     var gameOverTitle: String?
     var gameOverSubtitle = ""
-    var explorationForwardInput = 0.0
-    var explorationTurnInput = 0.0
-    var explorationTravelSpeed: Float = 0
-    var explorationHeadingDegrees: Float = 0
+    @ObservationIgnored var explorationForwardInput = 0.0
+    @ObservationIgnored var explorationTurnInput = 0.0
+    @ObservationIgnored var explorationTravelSpeed: Float = 0
+    @ObservationIgnored var explorationHeadingDegrees: Float = 0
+    var displayedExplorationTravelSpeed: Float = 0
+    var displayedExplorationHeadingDegrees: Float = 0
     var shipNavigationDistance: Float = 0
     var shipNavigationBearingDegrees: Float = 0
     var roverNavigationDistance: Float?
@@ -244,10 +349,53 @@ final class FlightModel {
     var collectedMinerals: [String: Int] = [:]
     var inventoryItems: [InventoryItem] = []
     var inventoryVisible = false
+    /// Loadout-kit gear menu; only pause path in single-player.
+    var isSettingsMenuPresented = false
+    var isPaused = false
+    var gameDifficulty: GameDifficulty = .normal
+    var shipDominantHand: DominantHandSetting = .right
+    var walkingDominantHand: DominantHandSetting = .right
+    var roverDominantHand: DominantHandSetting = .right
+    /// Confirmation sheet inside settings (`nil` = none).
+    var settingsResetPrompt: SettingsResetPrompt?
+    /// Tools available for the current difficulty / unlocks.
+    @ObservationIgnored var unlockedSurfaceToolIndices: Set<Int> =
+        Set(SurfaceTool.allCases.indices)
     var equippedInventoryItemID: String?
+    /// Player currency (Mon). Persisted under the legacy credits key.
+    var credits = 0
+    var organicEnergy: Float = ProgressionEconomy.baseOrganicEnergyCapacity
+    var shipFuel: Float = ProgressionEconomy.maxShipFuel
+    var hasNavModule = true
+    var ownedModuleIDs: Set<String> = []
+    var ownedBlueprintIDs: Set<String> = []
+    var crumblerEfficiencyTier = 0
+    var toolUpgradeTiers: [String: Int] = [:]
+    /// Permanent capacity expansions crafted (each +50, max 5).
+    var energyStorageExpansions = 0
+    var isRefineryPresented = false
+    var isStationShopPresented = false
+    @ObservationIgnored private var guaranteedAxeGranted = false
+    @ObservationIgnored private var relicLocatorEntity: Entity?
+
+    var mon: Int {
+        get { credits }
+        set { credits = max(0, newValue) }
+    }
+    var organicEnergyCapacity: Float {
+        ProgressionEconomy.organicEnergyCapacity(
+            expansions: energyStorageExpansions
+        )
+    }
 
     let inventoryCapacity = 100
     let inventoryDemoSlotCount = 50
+    @ObservationIgnored private var dockedStationHostPlanetName: String?
+    @ObservationIgnored private var dockedStationHostPlanetKind:
+        CelestialBodyKind?
+    @ObservationIgnored private var dockedStationSpecialty:
+        StationMaterialFamily?
+    @ObservationIgnored private var dockedStationSystemSector: GalacticSector?
 
     @ObservationIgnored var universeRoot: Entity?
     @ObservationIgnored var universeStreamer: UniverseStreamer?
@@ -266,6 +414,10 @@ final class FlightModel {
     @ObservationIgnored var playerAttitude = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
     @ObservationIgnored var lastTick = ContinuousClock.now
     @ObservationIgnored var telemetryAccumulator: TimeInterval = 0
+    @ObservationIgnored var sceneUpdateSubscription: EventSubscription?
+    @ObservationIgnored var onFrameExtras: (() -> Void)?
+    @ObservationIgnored private var lastCheckpointPlayerPosition:
+        GalacticPosition?
     @ObservationIgnored var nearbyInteractionTarget: NearbyNavigationTarget?
     @ObservationIgnored var lockedTargetIdentifier: String?
     @ObservationIgnored var securedLocationKind: NavigationTargetKind?
@@ -296,6 +448,21 @@ final class FlightModel {
     @ObservationIgnored var explorationNorth = SIMD3<Float>(0, 0, -1)
     @ObservationIgnored var explorationEast = SIMD3<Float>(1, 0, 0)
     @ObservationIgnored var surfaceStepHeight: Float = 0
+    /// Extra height from on-foot jetpack thrust / slow fall (walking only).
+    @ObservationIgnored var surfaceJetpackAltitude: Float = 0
+    @ObservationIgnored var surfaceJetpackVelocity: Float = 0
+    /// Max rocket / jetpack flight time in seconds (full bar).
+    static let jetpackFuelCapacity: Float = 5
+    @ObservationIgnored var surfaceJetpackFuel: Float = FlightModel.jetpackFuelCapacity
+    @ObservationIgnored var isJetpackThrusting = false
+    @ObservationIgnored var isRunningGestureActive = false
+    @ObservationIgnored var controllerRunHeld = false
+    /// Gamepad can latch the kit open independently of the hand pose.
+    @ObservationIgnored var controllerSurfaceKitLatched = false
+    /// Hand-driven kit request (on foot: fist + thumb toward you).
+    @ObservationIgnored var handSurfaceKitActive = false
+    /// HUD mirror of jetpack fuel (0...capacity seconds).
+    var displayedJetpackFuel: Float = FlightModel.jetpackFuelCapacity
     @ObservationIgnored var landedShipPosition: GalacticPosition?
     @ObservationIgnored var landedShipAttitude: simd_quatf?
     @ObservationIgnored var surfaceShipPosition: GalacticPosition?
@@ -346,6 +513,7 @@ final class FlightModel {
                 from: locationData
             )
         }
+        loadPlayerSettings(defaults: defaults)
 
         guard let data = defaults.data(
             forKey: Self.inventoryStorageKey
@@ -354,6 +522,7 @@ final class FlightModel {
             InventorySnapshot.self,
             from: data
         ) else {
+            applyDifficultyLoadout(resetMeters: true)
             return
         }
 
@@ -367,7 +536,12 @@ final class FlightModel {
                 ? savedID
                 : nil
         }
+        credits = max(0, snapshot.credits ?? defaults.integer(forKey: Self.creditsStorageKey))
+        if let progression = snapshot.progression {
+            applyProgressionSnapshot(progression)
+        }
         rebuildCollectedItemCounts()
+        applyDifficultyLoadout(resetMeters: snapshot.progression == nil)
     }
 
     var travelSpeed: Float {
@@ -401,8 +575,20 @@ final class FlightModel {
         activeExplorationMode == "Deploy rover"
             || activeExplorationMode == "Leave on foot"
     }
+    var isTradeConcourseActive: Bool {
+        activeExplorationMode == "Visit trade concourse"
+    }
+    /// Inventory / loadout kit is available in every play context.
     var canPresentInventory: Bool {
-        isDocked || isLanded || isSurfaceExploration
+        gameOverTitle == nil
+    }
+
+    var dominantHandSettingForCurrentMode: DominantHandSetting {
+        switch activeExplorationMode {
+        case "Leave on foot": walkingDominantHand
+        case "Deploy rover": roverDominantHand
+        default: shipDominantHand
+        }
     }
     var isAutomatedFlightManeuver: Bool {
         automatedFlightPhase != .none
@@ -431,10 +617,12 @@ final class FlightModel {
             return "HOLD ITEM TO MOUTH FOR 2 SECONDS TO EAT"
         }
         return switch selectedSurfaceTool {
+        case .axe:
+            "AXE • CHOP TREES FOR ORGANIC ENERGY FEEDSTOCK"
         case .sonicSlicer:
             "AIM TOOL • PRESS THUMB DOWN TO ACTIVATE"
         case .matterCrumbler, .matterLauncher, .analyzer:
-            "AIM TOOL • PRESS THUMB DOWN TO ACTIVATE"
+            "AIM TOOL • ENERGY \(Int(organicEnergy)) • PRESS THUMB DOWN"
         case .empty:
             "LOOK TO STEER • EXTEND SECONDARY HAND TO WALK"
         }
@@ -442,8 +630,30 @@ final class FlightModel {
     var canCycleWeapons: Bool {
         !isDocked && !isLanded && !isAutomatedFlightManeuver
     }
-    var canUseDetection: Bool {
+    var canPresentDetectionPicker: Bool {
         !isDocked && !isLanded && !isAutomatedFlightManeuver
+    }
+    var canUseDetection: Bool {
+        hasNavModule && canPresentDetectionPicker
+    }
+    var detectionLockReason: String {
+        hasNavModule
+            ? ""
+            : "Requires Nav Module — buy at a station (§\(ProgressionEconomy.navModulePriceMon))"
+    }
+    var hasRoverRefinery: Bool {
+        ownedModuleIDs.contains(ProgressionEconomy.roverRefineryModuleID)
+    }
+    /// Ship: docked or landed in cockpit. Rover: only after Rover Refinery upgrade.
+    var isFabricatorAvailable: Bool {
+        guard !isShipDestroyed else { return false }
+        if !isOutsideShip && (isDocked || isLanded) {
+            return true
+        }
+        return activeExplorationMode == "Deploy rover" && hasRoverRefinery
+    }
+    var isStationShopAvailable: Bool {
+        isDocked && securedLocationKind == .station && !isOutsideShip
     }
     var canLeaveShip: Bool { !availableExitOptions.isEmpty }
     var canUseLandingControl: Bool {
@@ -485,6 +695,7 @@ final class FlightModel {
         if isDocked, securedLocationKind == .station {
             return [
                 "Visit trade concourse",
+                "Visit station shop",
                 "Visit shipyard",
                 "Explore station"
             ]
@@ -513,6 +724,7 @@ final class FlightModel {
         hyperDriveCountdown = 0
         isAtmosphericBoostHeld = false
         atmosphericBoostBlend = 0
+        isAtmosphericBoostActive = false
         isWithinPlanetAtmosphere = false
         automatedFlightPhase = .none
         automatedTargetIdentifier = nil
@@ -523,8 +735,9 @@ final class FlightModel {
         securedLocationIdentifier = nil
         securedLocationKind = nil
         securedLocationName = nil
+        clearDockedStationTradeContext()
         activeExplorationMode = nil
-        surfaceStepHeight = 0
+        resetWalkingLocomotionBoosts()
         landedShipPosition = nil
         landedShipAttitude = nil
         surfaceShipPosition = nil
@@ -548,7 +761,7 @@ final class FlightModel {
         shipShield = 500
         shipHull = 1_000
         isShipShieldActive = true
-        damageFlashOpacity = 0
+        setDamageFlashOpacity(0)
         gameOverTitle = nil
         gameOverSubtitle = ""
         gameOverRemaining = 0
@@ -560,6 +773,11 @@ final class FlightModel {
         explorationTurnInput = 0
         explorationTravelSpeed = 0
         explorationHeadingDegrees = 0
+        displayedTravelSpeed = 0
+        displayedDistanceTravelled = 0
+        displayedElapsedTime = 0
+        displayedExplorationTravelSpeed = 0
+        displayedExplorationHeadingDegrees = 0
         explorationHeading = [0, 0, -1]
         explorationNorth = [0, 0, -1]
         explorationEast = [1, 0, 0]
@@ -597,14 +815,976 @@ final class FlightModel {
         checkpointSaveAccumulator = 0
         restoreSavedLocation()
         universeStreamer?.update(around: playerPosition.sector)
+        ensureSafeSpawnOutsideStarHazard()
         applyCameraTransform()
         updateCockpitVisuals(dt: 0)
         updateTelemetry()
     }
 
+    /// Origin is the system sun center after the solar-system contract. Never
+    /// leave the player free-flying inside a star heat zone.
+    private func ensureSafeSpawnOutsideStarHazard() {
+        if isLanded { return }
+        let needsRescue: Bool
+        if let streamer = universeStreamer,
+           let star = streamer.nearestDestination(
+                to: playerPosition,
+                matching: .world
+           ),
+           star.celestialKind == .star {
+            let altitude = max(0, star.distance - star.radius)
+            let heatZoneDepth = max(star.radius * 0.6, 250)
+            needsRescue = altitude < heatZoneDepth
+        } else if !isDocked, !isLanded {
+            // Fresh start / reset with no station context: still rescue if we
+            // are sitting at galactic origin with no safe checkpoint.
+            needsRescue =
+                simd_length(playerPosition.local) < 50
+                && playerPosition.sector == .origin
+        } else {
+            needsRescue = false
+        }
+        guard needsRescue else { return }
+        dockAtStartingStation()
+    }
+
+    private func dockAtStartingStation() {
+        guard let streamer = universeStreamer else {
+            let station =
+                ProceduralUniverseGenerator(
+                    universeSeed: 0x5350_4143_4550_494C
+                ).startingStation()
+            playerPosition = GalacticPosition(
+                sector: .origin,
+                local: station.localPosition
+            )
+            isDocked = true
+            isLanded = false
+            securedLocationName = station.name
+            securedLocationKind = .station
+            dockedStationHostPlanetName = station.hostPlanetName
+            dockedStationHostPlanetKind = station.hostPlanetKind
+            dockedStationSpecialty = station.specialtyFamily
+            dockedStationSystemSector = .origin
+            starHeat = 0
+            speed = 0
+            throttle = 0
+            interactionStatus = "Docked at \(station.name)"
+            return
+        }
+        streamer.update(around: .origin)
+        let target = streamer.startingStationNavigationTarget()
+        playerPosition = GalacticPosition(
+            sector: .origin,
+            local: streamer.startingStation.localPosition
+        )
+        secureShip(to: target, landed: false)
+        starHeat = 0
+        speed = 0
+        throttle = 0
+        interactionStatus = "Docked at \(target.name)"
+        persistLocationCheckpoint()
+    }
+
     func saveProgress() {
         persistInventory()
         persistLocationCheckpoint()
+        persistPlayerSettings()
+    }
+
+    var damageIntakeMultiplier: Float {
+        switch gameDifficulty {
+        case .creative: 0
+        case .normal: 1
+        case .survivor: 1.75
+        }
+    }
+
+    /// Single-player only until multiplayer exists; gear is the only pause entry.
+    var allowsSimulationPause: Bool { true }
+
+    func openSettingsMenu() {
+        settingsResetPrompt = nil
+        isSettingsMenuPresented = true
+        if allowsSimulationPause {
+            isPaused = true
+        }
+        inventoryDismissedForCurrentGesture = false
+        inventoryVisible = true
+        interactionStatus =
+            isPaused ? "Paused • Settings" : "Settings"
+    }
+
+    func closeSettingsMenu() {
+        settingsResetPrompt = nil
+        isSettingsMenuPresented = false
+        isPaused = false
+        interactionStatus = ""
+        // Drop stale hand latch; re-open kit with fist / gamepad if needed.
+        handSurfaceKitActive = false
+        refreshSurfaceKitVisibility()
+    }
+
+    func setShipDominantHand(_ hand: DominantHandSetting) {
+        shipDominantHand = hand
+        persistPlayerSettings()
+        dominantHandName = dominantHandSettingForCurrentMode.rawValue
+    }
+
+    func setWalkingDominantHand(_ hand: DominantHandSetting) {
+        walkingDominantHand = hand
+        persistPlayerSettings()
+        dominantHandName = dominantHandSettingForCurrentMode.rawValue
+    }
+
+    func setRoverDominantHand(_ hand: DominantHandSetting) {
+        roverDominantHand = hand
+        persistPlayerSettings()
+        dominantHandName = dominantHandSettingForCurrentMode.rawValue
+    }
+
+    func beginSettingsResetPrompt(_ prompt: SettingsResetPrompt) {
+        settingsResetPrompt = prompt
+    }
+
+    func cancelSettingsResetPrompt() {
+        settingsResetPrompt = nil
+    }
+
+    /// Full wipe or testing world-reset; always relocates to the starting station.
+    func confirmSettingsReset(
+        difficulty: GameDifficulty,
+        keepInventoryAndCredits: Bool
+    ) {
+        gameDifficulty = difficulty
+        settingsResetPrompt = nil
+        isSettingsMenuPresented = false
+        isPaused = false
+        inventoryVisible = false
+        surfaceToolMenuVisible = false
+        surfaceToolMenuEntity?.isEnabled = false
+        handSurfaceKitActive = false
+        controllerSurfaceKitLatched = false
+
+        if !keepInventoryAndCredits {
+            inventoryItems = []
+            equippedInventoryItemID = nil
+            credits = 0
+            collectedLogs = [:]
+            collectedMinerals = [:]
+            collectedSurfaceItems = 0
+            hasRover = true
+            hasDrone = true
+            defaultsClearLocationCheckpoint()
+            persistInventory()
+        }
+
+        if !keepInventoryAndCredits {
+            ownedModuleIDs = []
+            ownedBlueprintIDs = []
+            crumblerEfficiencyTier = 0
+            toolUpgradeTiers = [:]
+            energyStorageExpansions = 0
+            hasNavModule = false
+            guaranteedAxeGranted = false
+            unlockedSurfaceToolIndices = [SurfaceTool.empty.rawIndex]
+        }
+        applyDifficultyLoadout(resetMeters: true)
+        persistPlayerSettings()
+
+        activeExplorationMode = nil
+        isStationShopPresented = false
+        isRefineryPresented = false
+        resetWalkingLocomotionBoosts()
+        universeStreamer?.endSurfaceExploration()
+        landedShipPosition = nil
+        landedShipAttitude = nil
+        surfaceShipPosition = nil
+        surfaceRoverPosition = nil
+        isRoverDeployed = false
+        cockpitEntity?.isEnabled = true
+        synchronizeTrueForwardParent()
+        trueForwardReferenceEntity?.isEnabled = true
+        isShipDestroyed = false
+        playerHealth = 20
+        roverShield = 60
+        roverHull = 100
+        shipShield = 500
+        shipHull = 1_000
+        gameOverTitle = nil
+        gameOverSubtitle = ""
+        setWeaponTrigger(false)
+        stop()
+        dockAtStartingStation()
+        universeStreamer?.update(around: playerPosition.sector)
+        applyCameraTransform()
+        updateTelemetry()
+        interactionStatus =
+            keepInventoryAndCredits
+                ? "World reset • \(difficulty.rawValue) • inventory kept (test)"
+                : "Game reset • \(difficulty.rawValue)"
+        saveProgress()
+    }
+
+    func openRefineryPanel() {
+        guard isFabricatorAvailable else {
+            interactionStatus =
+                activeExplorationMode == "Deploy rover"
+                    ? "Install Rover Refinery Module at a station first"
+                    : "Refinery available when docked or landed in the ship"
+            return
+        }
+        // Hide the loadout kit so its closer attachment cannot steal hits
+        // from the refinery panel (that looked like a frozen / unclosable UI).
+        inventoryVisible = false
+        inventoryDismissedForCurrentGesture = true
+        isSettingsMenuPresented = false
+        isPaused = false
+        isStationShopPresented = false
+        isRefineryPresented = true
+        setWeaponReticleSuppressed(true)
+        trueForwardReferenceEntity?.isEnabled = false
+        interactionStatus = "Refinery / Fabricator"
+    }
+
+    func closeRefineryPanel(clearStatus: Bool = true) {
+        guard isRefineryPresented else { return }
+        isRefineryPresented = false
+        inventoryDismissedForCurrentGesture = false
+        // Restore aiming / directional sights unless another modal owns them.
+        if !isStationShopPresented && !isSettingsMenuPresented {
+            setWeaponReticleSuppressed(false)
+        }
+        updateWeaponReticleVisual()
+        updateTrueForwardReference()
+        if clearStatus {
+            interactionStatus = ""
+        }
+    }
+
+    func closeStationShop() {
+        isStationShopPresented = false
+        if !isRefineryPresented && !isSettingsMenuPresented {
+            setWeaponReticleSuppressed(false)
+        }
+        updateWeaponReticleVisual()
+        updateTrueForwardReference()
+    }
+
+    private func defaultsClearLocationCheckpoint(
+        defaults: UserDefaults = .standard
+    ) {
+        savedLocationCheckpoint = nil
+        defaults.removeObject(forKey: Self.locationStorageKey)
+    }
+
+    private func loadPlayerSettings(defaults: UserDefaults = .standard) {
+        guard let data = defaults.data(forKey: Self.settingsStorageKey),
+              let snapshot = try? JSONDecoder().decode(
+                PlayerSettingsSnapshot.self,
+                from: data
+              ) else {
+            shipDominantHand = .right
+            walkingDominantHand = .right
+            roverDominantHand = .right
+            gameDifficulty = .normal
+            dominantHandName = DominantHandSetting.right.rawValue
+            return
+        }
+        shipDominantHand =
+            DominantHandSetting(rawValue: snapshot.shipDominantHand) ?? .right
+        walkingDominantHand =
+            DominantHandSetting(rawValue: snapshot.walkingDominantHand)
+            ?? .right
+        roverDominantHand =
+            DominantHandSetting(rawValue: snapshot.roverDominantHand) ?? .right
+        gameDifficulty =
+            GameDifficulty(rawValue: snapshot.difficulty) ?? .normal
+        dominantHandName = dominantHandSettingForCurrentMode.rawValue
+    }
+
+    private func persistPlayerSettings(
+        defaults: UserDefaults = .standard
+    ) {
+        let snapshot = PlayerSettingsSnapshot(
+            shipDominantHand: shipDominantHand.rawValue,
+            walkingDominantHand: walkingDominantHand.rawValue,
+            roverDominantHand: roverDominantHand.rawValue,
+            difficulty: gameDifficulty.rawValue
+        )
+        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        defaults.set(data, forKey: Self.settingsStorageKey)
+    }
+
+    private func applyDifficultyLoadout(resetMeters: Bool = false) {
+        switch gameDifficulty {
+        case .creative:
+            unlockedSurfaceToolIndices = Set(SurfaceTool.allCases.indices)
+            hasNavModule = true
+            ownedModuleIDs.insert(ProgressionEconomy.navModuleID)
+            if resetMeters {
+                energyStorageExpansions = 0
+                organicEnergy = organicEnergyCapacity
+                shipFuel = ProgressionEconomy.maxShipFuel
+            }
+        case .normal:
+            unlockedSurfaceToolIndices.formUnion([
+                SurfaceTool.empty.rawIndex,
+                SurfaceTool.axe.rawIndex,
+                SurfaceTool.sonicSlicer.rawIndex,
+                SurfaceTool.matterCrumbler.rawIndex,
+                SurfaceTool.analyzer.rawIndex
+            ])
+            hasNavModule = true
+            ownedModuleIDs.insert(ProgressionEconomy.navModuleID)
+            if resetMeters {
+                energyStorageExpansions = 0
+                organicEnergy = organicEnergyCapacity
+                shipFuel = ProgressionEconomy.maxShipFuel
+            }
+        case .survivor:
+            unlockedSurfaceToolIndices.formUnion([
+                SurfaceTool.empty.rawIndex,
+                SurfaceTool.axe.rawIndex
+            ])
+            // Early path: Axe ships with the starter kit.
+            guaranteedAxeGranted = true
+            hasNavModule = ownedModuleIDs.contains(
+                ProgressionEconomy.navModuleID
+            )
+            if resetMeters {
+                energyStorageExpansions = 0
+                organicEnergy = 25
+                shipFuel = 45
+            }
+        }
+        // Re-apply module tool unlocks earned in prior sessions.
+        for moduleID in ownedModuleIDs {
+            applyModuleUnlock(moduleID, persist: false)
+        }
+        organicEnergy = min(organicEnergy, organicEnergyCapacity)
+        if !unlockedSurfaceToolIndices.contains(selectedSurfaceToolIndex) {
+            selectedSurfaceToolIndex =
+                unlockedSurfaceToolIndices.sorted().first ?? 0
+        }
+        updateSelectedSurfaceToolVisual()
+        persistProgression()
+    }
+
+    private func applyProgressionSnapshot(_ snapshot: ProgressionSnapshot) {
+        energyStorageExpansions = max(
+            0,
+            min(
+                ProgressionEconomy.maxEnergyStorageExpansions,
+                snapshot.energyStorageExpansions ?? 0
+            )
+        )
+        organicEnergy = min(
+            organicEnergyCapacity,
+            max(0, snapshot.organicEnergy)
+        )
+        shipFuel = min(
+            ProgressionEconomy.maxShipFuel,
+            max(0, snapshot.shipFuel)
+        )
+        hasNavModule = snapshot.hasNavModule
+        ownedModuleIDs = Set(snapshot.ownedModuleIDs)
+        ownedBlueprintIDs = Set(snapshot.ownedBlueprintIDs)
+        crumblerEfficiencyTier = max(0, min(2, snapshot.crumblerEfficiencyTier))
+        toolUpgradeTiers = snapshot.toolUpgradeTiers
+        guaranteedAxeGranted = snapshot.guaranteedAxeGranted
+    }
+
+    private func makeProgressionSnapshot() -> ProgressionSnapshot {
+        ProgressionSnapshot(
+            organicEnergy: organicEnergy,
+            shipFuel: shipFuel,
+            hasNavModule: hasNavModule,
+            ownedModuleIDs: ownedModuleIDs.sorted(),
+            ownedBlueprintIDs: ownedBlueprintIDs.sorted(),
+            crumblerEfficiencyTier: crumblerEfficiencyTier,
+            toolUpgradeTiers: toolUpgradeTiers,
+            guaranteedAxeGranted: guaranteedAxeGranted,
+            energyStorageExpansions: energyStorageExpansions
+        )
+    }
+
+    private func persistProgression() {
+        persistInventory()
+    }
+
+    @discardableResult
+    func spendOrganicEnergy(_ amount: Float) -> Bool {
+        let cost =
+            amount * ProgressionEconomy.energyCostMultiplier(
+                difficulty: gameDifficulty
+            )
+        guard cost <= 0.000_1 || organicEnergy >= cost else {
+            surfaceToolStatus = "LOW ORGANIC ENERGY • convert logs at ship"
+            interactionStatus = surfaceToolStatus
+            return false
+        }
+        organicEnergy = max(0, organicEnergy - cost)
+        return true
+    }
+
+    func convertLogsToEnergy(maxLogs: Int = 50) -> Int {
+        guard isFabricatorAvailable else {
+            interactionStatus = "Convert organics while docked or landed"
+            return 0
+        }
+        var converted = 0
+        while converted < maxLogs,
+              organicEnergy < organicEnergyCapacity - 0.5,
+              let index = inventoryItems.firstIndex(where: {
+                  $0.category == .log && $0.quantity > 0
+              }) {
+            inventoryItems[index].quantity -= 1
+            if inventoryItems[index].quantity <= 0 {
+                let removedID = inventoryItems[index].id
+                inventoryItems.remove(at: index)
+                if equippedInventoryItemID == removedID {
+                    equippedInventoryItemID = nil
+                }
+            }
+            organicEnergy = min(
+                organicEnergyCapacity,
+                organicEnergy + ProgressionEconomy.energyPerLog
+            )
+            converted += 1
+        }
+        rebuildCollectedItemCounts()
+        persistInventory()
+        interactionStatus =
+            converted > 0
+                ? "Converted \(converted) log(s) → energy \(Int(organicEnergy))/\(Int(organicEnergyCapacity))"
+                : "No logs to convert (or energy full)"
+        return converted
+    }
+
+    /// Consume one equipped (or matched) energy cube for a one-shot recharge.
+    @discardableResult
+    func useEnergyCube(itemID: String? = nil) -> Bool {
+        let targetID = itemID ?? equippedInventoryItemID
+        guard let targetID,
+              let index = inventoryItems.firstIndex(where: {
+                  $0.id == targetID && $0.isEnergyCube
+              }),
+              let recharge = inventoryItems[index].energyRecharge,
+              recharge > 0 else {
+            interactionStatus = "Equip an Energy Cube to recharge"
+            return false
+        }
+        let before = organicEnergy
+        organicEnergy = min(organicEnergyCapacity, organicEnergy + recharge)
+        let gained = organicEnergy - before
+        consumeInventoryItem(identifiedBy: targetID)
+        persistInventory()
+        interactionStatus =
+            "Energy Cube used • +\(Int(gained.rounded())) "
+            + "(\(Int(organicEnergy))/\(Int(organicEnergyCapacity)))"
+        surfaceToolStatus = interactionStatus
+        return true
+    }
+
+    private func burnShipFuel(dt: Float) {
+        let mult = ProgressionEconomy.fuelCostMultiplier(
+            difficulty: gameDifficulty
+        )
+        guard mult > 0, !isOutsideShip, !isDocked, !isLanded else { return }
+        var rate: Float = 0
+        if isBoosting {
+            rate = ProgressionEconomy.hyperFuelPerSecond
+        } else if isAtmosphericBoostHeld || atmosphericBoostBlend > 0.05 {
+            rate = ProgressionEconomy.boostFuelPerSecond
+        } else if abs(speed) > 0.5 || throttle > 0.05 {
+            rate = ProgressionEconomy.cruiseFuelPerSecond * Float(max(throttle, 0.15))
+        }
+        guard rate > 0 else { return }
+        shipFuel = max(0, shipFuel - rate * mult * dt)
+        if shipFuel <= 0.01 {
+            if isBoosting || isHyperDriveCharging {
+                cancelHyperDriveCharge()
+                interactionStatus = "Fuel empty • hyperdrive offline"
+            }
+            if throttle > 0.25 {
+                throttle = 0.18
+            }
+            speed = min(speed, maximumForwardSpeed * 0.22)
+        }
+    }
+
+    func applyModuleUnlock(_ moduleID: String, persist: Bool = true) {
+        ownedModuleIDs.insert(moduleID)
+        switch moduleID {
+        case ProgressionEconomy.navModuleID:
+            hasNavModule = true
+        case "module.analyzer", "unlock.analyzer":
+            unlockedSurfaceToolIndices.insert(SurfaceTool.analyzer.rawIndex)
+        case "module.crumbler", "unlock.crumbler":
+            unlockedSurfaceToolIndices.insert(
+                SurfaceTool.matterCrumbler.rawIndex
+            )
+        case "module.slicer", "unlock.slicer":
+            unlockedSurfaceToolIndices.insert(SurfaceTool.sonicSlicer.rawIndex)
+        case "module.crumbler_efficiency":
+            crumblerEfficiencyTier = min(2, crumblerEfficiencyTier + 1)
+        case ProgressionEconomy.roverRefineryModuleID:
+            break
+        default:
+            break
+        }
+        if persist {
+            persistInventory()
+            updateSelectedSurfaceToolVisual()
+        }
+    }
+
+    @discardableResult
+    func purchaseShopSKU(_ sku: ProgressionEconomy.ShopSKU) -> Bool {
+        guard isStationShopAvailable else {
+            interactionStatus = "Dock at a station to use the shop"
+            return false
+        }
+        guard mon >= sku.priceMon else {
+            interactionStatus =
+                "Need \(ProgressionEconomy.formatMon(sku.priceMon))"
+                + " (have \(ProgressionEconomy.formatMon(mon)))"
+            return false
+        }
+        switch sku {
+        case .navModule:
+            guard !hasNavModule else {
+                interactionStatus = "Nav Module already installed"
+                return false
+            }
+            mon -= sku.priceMon
+            applyModuleUnlock(ProgressionEconomy.navModuleID)
+        case .unlockAnalyzer:
+            guard !unlockedSurfaceToolIndices.contains(
+                SurfaceTool.analyzer.rawIndex
+            ) else {
+                interactionStatus = "Analyzer already unlocked"
+                return false
+            }
+            mon -= sku.priceMon
+            applyModuleUnlock("module.analyzer")
+        case .unlockCrumbler:
+            guard !unlockedSurfaceToolIndices.contains(
+                SurfaceTool.matterCrumbler.rawIndex
+            ) else {
+                interactionStatus = "Matter Crumbler already unlocked"
+                return false
+            }
+            mon -= sku.priceMon
+            applyModuleUnlock("module.crumbler")
+        case .unlockSlicer:
+            guard !unlockedSurfaceToolIndices.contains(
+                SurfaceTool.sonicSlicer.rawIndex
+            ) else {
+                interactionStatus = "Sonic Slicer already unlocked"
+                return false
+            }
+            mon -= sku.priceMon
+            applyModuleUnlock("module.slicer")
+        case .upgradeCrumblerEfficiency:
+            guard crumblerEfficiencyTier < 2 else {
+                interactionStatus = "Crumbler efficiency maxed"
+                return false
+            }
+            mon -= sku.priceMon
+            applyModuleUnlock("module.crumbler_efficiency")
+        case .roverRefinery:
+            guard !hasRoverRefinery else {
+                interactionStatus = "Rover Refinery already installed"
+                return false
+            }
+            mon -= sku.priceMon
+            applyModuleUnlock(ProgressionEconomy.roverRefineryModuleID)
+        }
+        interactionStatus =
+            "Purchased \(sku.title) for \(ProgressionEconomy.formatMon(sku.priceMon))"
+        return true
+    }
+
+    @discardableResult
+    func refineInventoryItem(_ itemID: String) -> Bool {
+        guard isFabricatorAvailable,
+              let index = inventoryItems.firstIndex(where: { $0.id == itemID })
+        else {
+            interactionStatus = "Refine while docked or landed in the ship"
+            return false
+        }
+        let item = inventoryItems[index]
+        let yields = ProgressionEconomy.refineYield(
+            materialName: item.materialName,
+            category: item.category
+        )
+        guard !yields.isEmpty else {
+            interactionStatus = "Cannot refine \(item.displayName)"
+            return false
+        }
+        consumeInventoryItem(identifiedBy: itemID)
+        for yield in yields {
+            addElementToInventory(name: yield.element, count: yield.count)
+        }
+        persistInventory()
+        interactionStatus =
+            "Refined \(item.displayName) → "
+            + yields.map { "\($0.count)× \($0.element)" }.joined(separator: ", ")
+        return true
+    }
+
+    var canConvertLogsToEnergy: Bool {
+        isFabricatorAvailable
+            && organicEnergy < organicEnergyCapacity - 0.5
+            && categoryQuantity(.log) > 0
+    }
+
+    func inventoryElementCount(_ name: String) -> Int {
+        elementQuantity(name)
+    }
+
+    func inventoryCategoryCount(_ category: SurfacePickup.Category) -> Int {
+        categoryQuantity(category)
+    }
+
+    /// Whether every unlock gate and material cost for the recipe is met.
+    func canCraftRecipe(_ recipeID: String) -> Bool {
+        craftRecipeFailureReason(recipeID) == nil
+    }
+
+    func canCraftRecipe(
+        _ recipe: ProgressionEconomy.CraftRecipe
+    ) -> Bool {
+        craftRecipeFailureReason(recipe) == nil
+    }
+
+    /// Per-ingredient sufficiency for refinery list styling.
+    func recipeIngredientStatuses(
+        _ recipe: ProgressionEconomy.CraftRecipe
+    ) -> [(id: String, label: String, satisfied: Bool)] {
+        var rows: [(id: String, label: String, satisfied: Bool)] = []
+        for key in recipe.elements.keys.sorted() {
+            let need = recipe.elements[key] ?? 0
+            let have = elementQuantity(key)
+            rows.append(
+                (
+                    id: "element-\(key)",
+                    label: "\(need)× \(key)",
+                    satisfied: have >= need
+                )
+            )
+        }
+        if recipe.logCost > 0 {
+            rows.append(
+                (
+                    id: "logs",
+                    label: "\(recipe.logCost)× logs",
+                    satisfied: categoryQuantity(.log) >= recipe.logCost
+                )
+            )
+        }
+        if recipe.anyMineralCost > 0 {
+            rows.append(
+                (
+                    id: "minerals",
+                    label: "\(recipe.anyMineralCost)× any crystal",
+                    satisfied: categoryQuantity(.mineral)
+                        >= recipe.anyMineralCost
+                )
+            )
+        }
+        return rows
+    }
+
+    @discardableResult
+    func craftRecipe(_ recipeID: String) -> Bool {
+        guard isFabricatorAvailable,
+              let recipe = ProgressionEconomy.craftRecipes.first(where: {
+                  $0.id == recipeID
+              }) else {
+            interactionStatus = "Fabricator unavailable"
+            return false
+        }
+        if let reason = craftRecipeFailureReason(recipe) {
+            interactionStatus = reason
+            return false
+        }
+        for (element, need) in recipe.elements {
+            consumeElement(named: element, count: need)
+        }
+        if recipe.logCost > 0 {
+            consumeCategory(.log, count: recipe.logCost)
+        }
+        if recipe.anyMineralCost > 0 {
+            consumeCategory(.mineral, count: recipe.anyMineralCost)
+        }
+        if let tool = recipe.unlocksTool {
+            unlockedSurfaceToolIndices.insert(tool.rawIndex)
+        }
+        if let moduleID = recipe.grantsModuleID {
+            applyModuleUnlock(moduleID, persist: false)
+        }
+        if let blueprintID = recipe.grantsBlueprintID {
+            ownedBlueprintIDs.insert(blueprintID)
+        }
+        if let recharge = recipe.energyCubeRecharge {
+            addEnergyCubeToInventory(recharge: recharge, title: recipe.title)
+        }
+        if let bonus = recipe.energyCapacityBonus, bonus > 0 {
+            energyStorageExpansions = min(
+                ProgressionEconomy.maxEnergyStorageExpansions,
+                energyStorageExpansions + 1
+            )
+            interactionStatus =
+                "Fabricated \(recipe.title) • capacity "
+                + "\(Int(organicEnergyCapacity))"
+            persistInventory()
+            updateSelectedSurfaceToolVisual()
+            closeRefineryPanel(clearStatus: false)
+            return true
+        }
+        persistInventory()
+        updateSelectedSurfaceToolVisual()
+        interactionStatus = "Fabricated \(recipe.title)"
+        closeRefineryPanel(clearStatus: false)
+        return true
+    }
+
+    private func craftRecipeFailureReason(
+        _ recipeID: String
+    ) -> String? {
+        guard let recipe = ProgressionEconomy.craftRecipes.first(where: {
+            $0.id == recipeID
+        }) else {
+            return "Unknown recipe"
+        }
+        return craftRecipeFailureReason(recipe)
+    }
+
+    private func craftRecipeFailureReason(
+        _ recipe: ProgressionEconomy.CraftRecipe
+    ) -> String? {
+        guard isFabricatorAvailable else {
+            return "Fabricator unavailable"
+        }
+        if let blueprintID = recipe.blueprintID,
+           !ownedBlueprintIDs.contains(blueprintID) {
+            return "Missing blueprint for \(recipe.title)"
+        }
+        if let required = recipe.requiredStorageExpansions {
+            guard energyStorageExpansions == required else {
+                return required == 0
+                    ? "Storage expansion already beyond tier I"
+                    : "Craft prior Energy Storage upgrade first"
+            }
+            guard energyStorageExpansions
+                < ProgressionEconomy.maxEnergyStorageExpansions else {
+                return "Energy storage fully expanded"
+            }
+        }
+        for (element, need) in recipe.elements {
+            let have = elementQuantity(element)
+            if have < need {
+                return "Need \(need)× \(element) (have \(have))"
+            }
+        }
+        if recipe.logCost > 0 {
+            let have = categoryQuantity(.log)
+            if have < recipe.logCost {
+                return "Need \(recipe.logCost)× logs (have \(have))"
+            }
+        }
+        if recipe.anyMineralCost > 0 {
+            let have = categoryQuantity(.mineral)
+            if have < recipe.anyMineralCost {
+                return "Need \(recipe.anyMineralCost)× crystals/minerals"
+                    + " (have \(have))"
+            }
+        }
+        if let recharge = recipe.energyCubeRecharge {
+            let canStack = inventoryItems.contains {
+                $0.isEnergyCube
+                    && abs(($0.energyRecharge ?? 0) - recharge) < 0.1
+                    && $0.materialName == recipe.title
+            }
+            if !canStack && inventoryItems.count >= inventoryCapacity {
+                return "Inventory full • cannot store Energy Cube"
+            }
+        }
+        return nil
+    }
+
+    private func elementQuantity(_ name: String) -> Int {
+        inventoryItems
+            .filter {
+                $0.category == .element
+                    && ($0.processedElementName == name
+                        || $0.materialName == name)
+            }
+            .reduce(0) { $0 + $1.quantity }
+    }
+
+    private func categoryQuantity(_ category: SurfacePickup.Category) -> Int {
+        inventoryItems
+            .filter { $0.category == category }
+            .reduce(0) { $0 + $1.quantity }
+    }
+
+    private func consumeElement(named name: String, count: Int) {
+        var remaining = count
+        while remaining > 0,
+              let index = inventoryItems.firstIndex(where: {
+                  $0.category == .element
+                      && ($0.processedElementName == name
+                          || $0.materialName == name)
+                      && $0.quantity > 0
+              }) {
+            let take = min(remaining, inventoryItems[index].quantity)
+            inventoryItems[index].quantity -= take
+            remaining -= take
+            if inventoryItems[index].quantity <= 0 {
+                inventoryItems.remove(at: index)
+            }
+        }
+    }
+
+    private func consumeCategory(
+        _ category: SurfacePickup.Category,
+        count: Int
+    ) {
+        var remaining = count
+        while remaining > 0,
+              let index = inventoryItems.firstIndex(where: {
+                  $0.category == category && $0.quantity > 0
+              }) {
+            let take = min(remaining, inventoryItems[index].quantity)
+            inventoryItems[index].quantity -= take
+            remaining -= take
+            if inventoryItems[index].quantity <= 0 {
+                let removedID = inventoryItems[index].id
+                inventoryItems.remove(at: index)
+                if equippedInventoryItemID == removedID {
+                    equippedInventoryItemID = nil
+                }
+            }
+        }
+        rebuildCollectedItemCounts()
+    }
+
+    private func addEnergyCubeToInventory(
+        recharge: Float,
+        title: String
+    ) {
+        let name = title
+        if let index = inventoryItems.firstIndex(where: {
+            $0.isEnergyCube
+                && abs(($0.energyRecharge ?? 0) - recharge) < 0.1
+                && $0.materialName == name
+        }) {
+            inventoryItems[index].quantity += 1
+            return
+        }
+        guard inventoryItems.count < inventoryCapacity else {
+            interactionStatus = "Inventory full • cannot store Energy Cube"
+            return
+        }
+        inventoryItems.append(
+            InventoryItem(
+                id: "energy-cube-\(Int(recharge))-\(UUID().uuidString)",
+                materialName: name,
+                category: .electronic,
+                sourcePlanetIdentifier: "",
+                sourcePlanetName: "Fabricator",
+                sourcePlanetKind: .rocky,
+                quantity: 1,
+                processedElementName: nil,
+                energyRecharge: recharge
+            )
+        )
+    }
+
+    private func addElementToInventory(name: String, count: Int) {
+        if let index = inventoryItems.firstIndex(where: {
+            $0.category == .element
+                && ($0.processedElementName == name || $0.materialName == name)
+        }) {
+            inventoryItems[index].quantity += count
+            return
+        }
+        guard inventoryItems.count < inventoryCapacity else { return }
+        inventoryItems.append(
+            InventoryItem(
+                id: "element-\(name)-\(UUID().uuidString)",
+                materialName: name,
+                category: .element,
+                sourcePlanetIdentifier: "",
+                sourcePlanetName: "Refinery",
+                sourcePlanetKind: .rocky,
+                quantity: count,
+                processedElementName: name
+            )
+        )
+    }
+
+    @discardableResult
+    func openEquippedRelic() -> Bool {
+        guard let item = equippedInventoryItem, item.isRelic else {
+            interactionStatus = "Equip a Relic to open it"
+            return false
+        }
+        guard item.relicCanOpen == true else {
+            interactionStatus = "Relic needs a fused Relic Key"
+            return false
+        }
+        consumeInventoryItem(identifiedBy: item.id)
+        // Open rewards: high-tier materials + chance at blueprint/module.
+        addElementToInventory(name: "Titanium", count: 3)
+        addElementToInventory(name: "Gold", count: 2)
+        addElementToInventory(name: "Silicon", count: 2)
+        let roll = Int.random(in: 0...99)
+        if roll < 35 {
+            ownedBlueprintIDs.insert(ProgressionEconomy.analyzerBlueprintID)
+            interactionStatus = "Relic opened • Analyzer blueprint recovered"
+        } else if roll < 60 {
+            ownedBlueprintIDs.insert(ProgressionEconomy.crumblerBlueprintID)
+            interactionStatus = "Relic opened • Crumbler blueprint recovered"
+        } else if roll < 75 {
+            applyModuleUnlock("module.slicer")
+            interactionStatus = "Relic opened • Sonic Slicer module recovered"
+        } else {
+            mon += 80
+            interactionStatus =
+                "Relic opened • materials + \(ProgressionEconomy.formatMon(80))"
+        }
+        persistInventory()
+        return true
+    }
+
+    func relicKeyCount() -> Int {
+        inventoryItems
+            .filter(\.isRelicKey)
+            .reduce(0) { $0 + $1.quantity }
+    }
+
+    @discardableResult
+    func consumeRelicKeyForPickup() -> Bool {
+        guard let index = inventoryItems.firstIndex(where: {
+            $0.isRelicKey && $0.quantity > 0
+        }) else {
+            return false
+        }
+        inventoryItems[index].quantity -= 1
+        if inventoryItems[index].quantity <= 0 {
+            let removed = inventoryItems[index].id
+            inventoryItems.remove(at: index)
+            if equippedInventoryItemID == removed {
+                equippedInventoryItemID = nil
+                updateHeldInventoryItemVisual()
+            }
+        }
+        return true
     }
 
     func stop() {
@@ -628,7 +1808,9 @@ final class FlightModel {
 
     private func applyShipDamage(_ amount: Float, reason: String) {
         guard amount > 0, !isShipDestroyed else { return }
-        var remaining = amount
+        setDamageFlashOpacity(max(simulationDamageFlashOpacity, 0.42))
+        guard gameDifficulty != .creative else { return }
+        var remaining = amount * damageIntakeMultiplier
         if isShipShieldActive && shipShield > 0 {
             let absorbed = min(shipShield, remaining)
             shipShield -= absorbed
@@ -637,7 +1819,6 @@ final class FlightModel {
         if remaining > 0 {
             shipHull = max(isOutsideShip ? 1 : 0, shipHull - remaining)
         }
-        damageFlashOpacity = max(damageFlashOpacity, 0.42)
         guard shipHull <= 0, !isOutsideShip else { return }
         isShipDestroyed = true
         cancelHyperDriveCharge()
@@ -657,9 +1838,10 @@ final class FlightModel {
             universeStreamer?.consumeCreatureAttacks()
                 ?? (hits: 0, knockback: SIMD3<Float>.zero)
         guard attacks.hits > 0 else { return }
-        damageFlashOpacity = max(damageFlashOpacity, 0.34)
+        setDamageFlashOpacity(max(simulationDamageFlashOpacity, 0.34))
+        guard gameDifficulty != .creative else { return }
         if activeExplorationMode == "Deploy rover" {
-            var damage = Float(attacks.hits)
+            var damage = Float(attacks.hits) * damageIntakeMultiplier
             let shieldDamage = min(roverShield, damage)
             roverShield -= shieldDamage
             damage -= shieldDamage
@@ -670,7 +1852,10 @@ final class FlightModel {
             return
         }
 
-        playerHealth = max(0, playerHealth - Float(attacks.hits))
+        playerHealth = max(
+            0,
+            playerHealth - Float(attacks.hits) * damageIntakeMultiplier
+        )
         if simd_length_squared(attacks.knockback) > 0.0001 {
             pendingSurfaceKnockback +=
                 simd_normalize(attacks.knockback)
@@ -744,7 +1929,7 @@ final class FlightModel {
         }
         playerHealth = 20
         pendingSurfaceKnockback = .zero
-        damageFlashOpacity = 0
+        setDamageFlashOpacity(0)
         gameOverTitle = nil
         gameOverSubtitle = ""
         applyCameraTransform()
@@ -763,7 +1948,7 @@ final class FlightModel {
         isRoverDeployed = false
         universeStreamer?.endSurfaceExploration()
         cockpitEntity?.isEnabled = true
-        surfaceStepHeight = 0
+        resetWalkingLocomotionBoosts()
         surfaceShipPosition = nil
         surfaceRoverPosition = nil
         landedShipPosition = nil
@@ -1082,6 +2267,11 @@ final class FlightModel {
             isDocked = false
             securedLocationKind = nil
             securedLocationName = nil
+            clearDockedStationTradeContext()
+            if isTradeConcourseActive {
+                activeExplorationMode = nil
+                cockpitEntity?.isEnabled = true
+            }
             interactionStatus = "Undocked"
             return
         }
@@ -1151,7 +2341,7 @@ final class FlightModel {
         throttle = 0
         speed = 0
         activeExplorationMode = nil
-        surfaceStepHeight = 0
+        resetWalkingLocomotionBoosts()
         isLanded = false
         automatedTargetIdentifier = world.identifier
         takeoffTargetDistance = world.distance + 30.48
@@ -1161,11 +2351,25 @@ final class FlightModel {
 
     func selectExitOption(_ option: String) {
         guard availableExitOptions.contains(option) else { return }
+        if option == "Visit station shop" {
+            inventoryVisible = false
+            inventoryDismissedForCurrentGesture = true
+            isRefineryPresented = false
+            isStationShopPresented = true
+            setWeaponReticleSuppressed(true)
+            trueForwardReferenceEntity?.isEnabled = false
+            interactionStatus =
+                "Station shop • Mon \(ProgressionEconomy.formatMon(mon))"
+            return
+        }
         landedShipPosition = playerPosition
         landedShipAttitude = playerAttitude
         activeExplorationMode = option
         walkingRecoveryUsesRover = false
         cockpitEntity?.isEnabled = false
+        synchronizeTrueForwardParent()
+        trueForwardReferenceEntity?.isEnabled =
+            option == "Deploy rover"
         interactionStatus = option
         if isSurfaceExploration {
             initializeExplorationHeading()
@@ -1219,7 +2423,7 @@ final class FlightModel {
             surfaceRoverPosition = nil
         }
         activeExplorationMode = nil
-        surfaceStepHeight = 0
+        resetWalkingLocomotionBoosts()
         universeStreamer?.endSurfaceExploration()
         if let shipPosition = landedShipPosition {
             playerPosition = shipPosition
@@ -1235,6 +2439,8 @@ final class FlightModel {
         roverNavigationDistance = nil
         roverNavigationBearingDegrees = nil
         cockpitEntity?.isEnabled = true
+        synchronizeTrueForwardParent()
+        trueForwardReferenceEntity?.isEnabled = true
         interactionStatus = "Returned to ship"
         applyCameraTransform()
         universeStreamer?.updateSurfaceDetailVisibility(
@@ -1252,9 +2458,112 @@ final class FlightModel {
     func setWalkingGestureActive(_ active: Bool) {
         guard activeExplorationMode == "Leave on foot" else {
             walkingGestureActive = false
+            isRunningGestureActive = false
             return
         }
-        walkingGestureActive = active && !surfaceToolMenuVisible
+        // Kit may stay open from gamepad latch while walking.
+        walkingGestureActive = active
+        if !walkingGestureActive {
+            isRunningGestureActive = false
+        }
+    }
+
+    func setRunningGestureActive(_ active: Bool) {
+        guard activeExplorationMode == "Leave on foot",
+              walkingGestureActive || explorationForwardInput > 0.12 else {
+            isRunningGestureActive = false
+            return
+        }
+        isRunningGestureActive = active
+    }
+
+    func setJetpackThrusting(_ active: Bool) {
+        guard activeExplorationMode == "Leave on foot" else {
+            isJetpackThrusting = false
+            return
+        }
+        isJetpackThrusting = active
+    }
+
+    func setControllerRunHeld(_ held: Bool) {
+        guard activeExplorationMode == "Leave on foot" else {
+            controllerRunHeld = false
+            return
+        }
+        controllerRunHeld = held
+    }
+
+    var isSurfaceKitVisible: Bool {
+        inventoryVisible || surfaceToolMenuVisible
+    }
+
+    /// Recompute kit visibility from hand kit pose and/or gamepad latch.
+    func refreshSurfaceKitVisibility() {
+        setSurfaceKitVisible(handSurfaceKitActive || controllerSurfaceKitLatched)
+    }
+
+    func setHandSurfaceKitActive(_ active: Bool) {
+        handSurfaceKitActive = active
+        if active {
+            // Palm takes priority; clear stale controller latch conflict by
+            // keeping both OR'd in refreshSurfaceKitVisibility.
+        }
+        refreshSurfaceKitVisibility()
+    }
+
+    /// Hand / gamepad kit: inventory and (on foot) tool menu together.
+    /// Does not interrupt walk, run, or jetpack.
+    func setSurfaceKitVisible(_ visible: Bool) {
+        // Settings owns pause; keep the inventory panel until the gear closes.
+        if isSettingsMenuPresented && !visible {
+            handSurfaceKitActive = false
+            inventoryVisible = true
+            surfaceToolMenuVisible = false
+            surfaceToolMenuEntity?.isEnabled = false
+            return
+        }
+
+        let showInventory = visible && canPresentInventory
+        let showTools =
+            visible && activeExplorationMode == "Leave on foot"
+
+        if !showInventory {
+            inventoryVisible = false
+            inventoryDismissedForCurrentGesture = false
+        } else if !inventoryDismissedForCurrentGesture {
+            inventoryVisible = true
+        }
+
+        surfaceToolMenuVisible = showTools
+        surfaceToolMenuEntity?.isEnabled = showTools
+        if showTools {
+            surfaceToolStatus =
+                "Kit open • index tap/swipe tools • select inventory items"
+        }
+        if !visible {
+            handSurfaceKitActive = false
+        }
+    }
+
+    func toggleSurfaceKit() {
+        // Don't dismiss via gamepad toggle while paused in settings.
+        guard !isSettingsMenuPresented else { return }
+        controllerSurfaceKitLatched.toggle()
+        if !controllerSurfaceKitLatched {
+            handSurfaceKitActive = false
+        }
+        refreshSurfaceKitVisibility()
+    }
+
+    func resetWalkingLocomotionBoosts() {
+        isRunningGestureActive = false
+        isJetpackThrusting = false
+        controllerRunHeld = false
+        surfaceStepHeight = 0
+        surfaceJetpackAltitude = 0
+        surfaceJetpackVelocity = 0
+        surfaceJetpackFuel = Self.jetpackFuelCapacity
+        displayedJetpackFuel = Self.jetpackFuelCapacity
     }
 
     func configureSurfaceTools(
@@ -1273,25 +2582,26 @@ final class FlightModel {
     }
 
     func setInventoryVisible(_ visible: Bool) {
-        let shouldShow = visible && canPresentInventory
-        if !shouldShow {
+        // Inventory is part of the shared surface kit.
+        if visible {
+            inventoryDismissedForCurrentGesture = false
+            setSurfaceKitVisible(true)
+        } else if !surfaceToolMenuVisible {
+            setSurfaceKitVisible(false)
+        } else {
             inventoryVisible = false
             inventoryDismissedForCurrentGesture = false
-        } else if !inventoryDismissedForCurrentGesture {
-            inventoryVisible = true
-            setSurfaceToolMenuVisible(false)
-            walkingGestureActive = false
         }
     }
 
     func setSurfaceToolMenuVisible(_ visible: Bool) {
-        let shouldShow =
-            visible && activeExplorationMode == "Leave on foot"
-        surfaceToolMenuVisible = shouldShow
-        surfaceToolMenuEntity?.isEnabled = shouldShow
-        if shouldShow {
-            walkingGestureActive = false
-            surfaceToolStatus = "Tap or swipe with right index finger"
+        if visible {
+            setSurfaceKitVisible(true)
+        } else if !inventoryVisible {
+            setSurfaceKitVisible(false)
+        } else {
+            surfaceToolMenuVisible = false
+            surfaceToolMenuEntity?.isEnabled = false
         }
     }
 
@@ -1339,7 +2649,10 @@ final class FlightModel {
     }
 
     func selectSurfaceTool(at index: Int) {
-        guard SurfaceTool.allCases.indices.contains(index) else { return }
+        guard SurfaceTool.allCases.indices.contains(index),
+              unlockedSurfaceToolIndices.contains(index) else {
+            return
+        }
         stopMatterCrumblerBeam()
         equippedInventoryItemID = nil
         persistInventory()
@@ -1353,10 +2666,16 @@ final class FlightModel {
     }
 
     func cycleSurfaceTool(by offset: Int) {
-        let count = SurfaceTool.allCases.count
-        selectSurfaceTool(
-            at: (selectedSurfaceToolIndex + offset + count) % count
-        )
+        let unlocked = unlockedSurfaceToolIndices.sorted()
+        guard !unlocked.isEmpty else { return }
+        guard let current = unlocked.firstIndex(
+            of: selectedSurfaceToolIndex
+        ) else {
+            selectSurfaceTool(at: unlocked[0])
+            return
+        }
+        let next = (current + offset + unlocked.count) % unlocked.count
+        selectSurfaceTool(at: unlocked[next])
     }
 
     func updateHeldSurfaceToolPose(
@@ -1398,8 +2717,7 @@ final class FlightModel {
         selectedSurfaceToolIndex = 0
         updateSelectedSurfaceToolVisual()
         updateHeldInventoryItemVisual()
-        inventoryVisible = false
-        inventoryDismissedForCurrentGesture = true
+        // Keep the shared kit open so tools and inventory stay available.
         surfaceToolStatus =
             "\(item.displayName) equipped from \(item.sourcePlanetName)"
     }
@@ -1409,8 +2727,10 @@ final class FlightModel {
             surfaceToolStatus = "Activation • no item in dominant hand"
             return
         }
-        // Item-specific activation behavior will branch here as those
-        // behaviors are defined.
+        if item.isEnergyCube {
+            _ = useEnergyCube(itemID: item.id)
+            return
+        }
         surfaceToolStatus = "Activation • \(item.displayName) activated"
     }
 
@@ -1497,8 +2817,13 @@ final class FlightModel {
             return
         }
         if lowercasedName.hasSuffix(" feces") {
+            setDamageFlashOpacity(max(simulationDamageFlashOpacity, 0.34))
+            if gameDifficulty == .creative {
+                surfaceToolStatus =
+                    "Ate \(item.displayName) • damage feedback only"
+                return
+            }
             playerHealth = max(0, playerHealth - 5)
-            damageFlashOpacity = max(damageFlashOpacity, 0.34)
             surfaceToolStatus =
                 "Ate \(item.displayName) • −5 health"
             if playerHealth <= 0 {
@@ -1527,8 +2852,17 @@ final class FlightModel {
         direction: SIMD3<Float>? = nil
     ) {
         guard activeExplorationMode == "Leave on foot" else { return }
+        // Instant tools only. Matter crumbler is continuous and must go
+        // through updateMatterCrumblerBeam with a per-tick damage amount.
+        let tool = selectedSurfaceTool
+        guard tool == .sonicSlicer || tool == .axe else { return }
+        let energyCost: Float =
+            tool == .axe
+                ? ProgressionEconomy.axeEnergyCost
+                : ProgressionEconomy.slicerEnergyCost
+        guard spendOrganicEnergy(energyCost) else { return }
         if let material = universeStreamer?.applySurfaceTool(
-            selectedSurfaceTool,
+            tool,
             atWorldPosition: point,
             direction: direction
         ) {
@@ -1547,6 +2881,13 @@ final class FlightModel {
             stopMatterCrumblerBeam()
             return
         }
+        let efficiency = 1 - 0.25 * Float(crumblerEfficiencyTier)
+        let energyRate =
+            ProgressionEconomy.crumblerEnergyPerSecond * max(0.5, efficiency)
+        guard spendOrganicEnergy(energyRate * max(deltaTime, 1.0 / 60.0)) else {
+            stopMatterCrumblerBeam()
+            return
+        }
         let aim = simd_normalize(direction)
         lastMatterCrumblerOrigin = position
         lastMatterCrumblerDirection = aim
@@ -1554,32 +2895,45 @@ final class FlightModel {
         if let existing = matterCrumblerBeamEntity {
             beam = existing
         } else {
+            var material = UnlitMaterial(color: .cyan)
+            material.blending = .transparent(opacity: .init(floatLiteral: 0.92))
             let created = ModelEntity(
-                mesh: .generateCylinder(height: 12, radius: 0.024),
-                materials: [
-                    UnlitMaterial(
-                        color: UIColor.systemCyan.withAlphaComponent(0.88)
-                    )
-                ]
+                mesh: .generateCylinder(height: 12, radius: 0.045),
+                materials: [material]
             )
             created.name = "Matter Crumbler Continuous Beam"
+            let sortGroup = ModelSortGroup(depthPass: .postPass)
+            created.components.set(
+                ModelSortGroupComponent(group: sortGroup, order: 8_500)
+            )
+            created.components.set(OpacityComponent(opacity: 0.92))
             sceneRoot.addChild(created)
             matterCrumblerBeamEntity = created
             beam = created
         }
-        beam.position = position + aim * 6
+        let worldCenter = position + aim * 6
+        beam.position = sceneRoot.convert(position: worldCenter, from: nil)
+        let localAim = simd_normalize(
+            sceneRoot.convert(direction: aim, from: nil)
+        )
         beam.orientation = simd_quatf(
             from: SIMD3<Float>(0, 1, 0),
-            to: aim
+            to: localAim
         )
-        matterCrumblerBeamTimeout = 0.14
+        beam.isEnabled = true
+        matterCrumblerBeamTimeout = 0.18
 
         guard deltaTime > 0 else { return }
+        // Slow continuous grind: 10 HP/s, hard-capped so a tracking hitch
+        // cannot dump a burst of damage in one callback.
+        let damagePerSecond: Float = 10
+        let tickDamage =
+            damagePerSecond * min(deltaTime, 1.0 / 30.0)
         if let result = universeStreamer?.applySurfaceTool(
             .matterCrumbler,
             atWorldPosition: position,
             direction: aim,
-            damageAmount: 40 * min(deltaTime, 0.10)
+            damageAmount: tickDamage
         ) {
             surfaceToolStatus = result
         }
@@ -1599,12 +2953,113 @@ final class FlightModel {
                 && matterCrumblerBeamEntity != nil
     }
 
+    /// Head-aimed origin/direction for gamepad surface tools on foot.
+    func controllerSurfaceAim() -> (
+        origin: SIMD3<Float>,
+        direction: SIMD3<Float>
+    ) {
+        let direction: SIMD3<Float>
+        if hasWalkingFacingDirection {
+            direction = simd_normalize(
+                playerAttitude.act(walkingFacingDirection)
+            )
+        } else {
+            direction = weaponAimDirection
+        }
+        let eye =
+            aimAnchorEntity?.position(relativeTo: nil)
+                ?? SIMD3<Float>.zero
+        return (eye + direction * 0.28, direction)
+    }
+
+    /// Edge/hold tool use from a game controller while on foot.
+    func updateControllerSurfaceTool(
+        pressed: Bool,
+        wasPressed: Bool,
+        deltaTime: Float
+    ) {
+        guard activeExplorationMode == "Leave on foot" else {
+            stopMatterCrumblerBeam()
+            return
+        }
+        let aim = controllerSurfaceAim()
+        switch selectedSurfaceTool {
+        case .matterCrumbler:
+            if pressed {
+                updateMatterCrumblerBeam(
+                    from: aim.origin,
+                    direction: aim.direction,
+                    deltaTime: deltaTime
+                )
+            } else if wasPressed {
+                // Only a real RT release stops the beam. Idle pulses must
+                // not cancel a hand-driven crumbler.
+                stopMatterCrumblerBeam()
+            }
+        case .sonicSlicer, .axe:
+            if pressed, !wasPressed {
+                applySelectedSurfaceTool(
+                    atWorldPosition: aim.origin,
+                    direction: aim.direction
+                )
+            }
+        case .matterLauncher:
+            if pressed, !wasPressed {
+                fireMatterLauncher(
+                    from: aim.origin,
+                    direction: aim.direction
+                )
+            }
+        case .analyzer:
+            if pressed, !wasPressed {
+                showSurfaceToolActivation(
+                    .analyzer,
+                    from: aim.origin,
+                    direction: aim.direction
+                )
+                analyzeSurfaceTarget(
+                    from: aim.origin,
+                    direction: aim.direction
+                )
+            }
+        case .empty:
+            if wasPressed {
+                stopMatterCrumblerBeam()
+            }
+        }
+    }
+
+    func collectWithControllerGaze() {
+        guard activeExplorationMode == "Leave on foot" else { return }
+        let aim = controllerSurfaceAim()
+        collectLookedAtSurfaceItem(
+            from: aim.origin,
+            direction: aim.direction
+        )
+    }
+
+    func boardNearestSurfaceVehicle() {
+        if canEnterShip {
+            returnToShip()
+        } else if canEnterRover {
+            enterRover()
+        } else if activeExplorationMode == "Deploy rover" {
+            leaveRover()
+        } else {
+            interactionStatus =
+                "Move within 15 m of the ship or rover"
+        }
+    }
+
     func analyzeSurfaceTarget(
         from position: SIMD3<Float>,
         direction: SIMD3<Float>
     ) {
         guard activeExplorationMode == "Leave on foot",
               selectedSurfaceTool == .analyzer else {
+            return
+        }
+        guard spendOrganicEnergy(ProgressionEconomy.analyzerEnergyCost) else {
             return
         }
         surfaceToolStatus =
@@ -1633,6 +3088,23 @@ final class FlightModel {
         direction: SIMD3<Float>
     ) {
         guard activeExplorationMode == "Leave on foot" else { return }
+        if let relicPickup = universeStreamer?.collectScannedRelic(
+            from: position,
+            direction: direction,
+            maximumDistance: 15
+        ) {
+            guard consumeRelicKeyForPickup() else {
+                surfaceToolStatus =
+                    "Relic scanned • need a Relic Key to claim intact"
+                return
+            }
+            var claimed = relicPickup
+            claimed.relicCanOpen = true
+            store(claimed)
+            surfaceToolStatus =
+                "Relic claimed • Relic Key fused"
+            return
+        }
         guard let pickups = universeStreamer?.collectLooseSurfaceItems(
             from: position,
             direction: direction,
@@ -1650,6 +3122,9 @@ final class FlightModel {
     ) {
         guard activeExplorationMode == "Leave on foot",
               selectedSurfaceTool == .matterLauncher else {
+            return
+        }
+        guard spendOrganicEnergy(ProgressionEconomy.launcherEnergyCost) else {
             return
         }
         guard let ammo = collectedMinerals
@@ -1708,6 +3183,7 @@ final class FlightModel {
         case .analyzer: .systemGreen
         case .matterLauncher: .systemOrange
         case .sonicSlicer: .systemBlue
+        case .axe: .systemBrown
         case .empty: .clear
         }
         let pulse = ModelEntity(
@@ -1898,6 +3374,11 @@ final class FlightModel {
         case .mineral: "minerals"
         case .electronic: "electronics"
         case .creatureMaterial: "creature materials"
+        case .relic: "relics"
+        case .relicKey: "relic keys"
+        case .element: "elements"
+        case .blueprint: "blueprints"
+        case .module: "modules"
         }
         surfaceToolStatus =
             "Collected \(collectedCount) \(pileName)"
@@ -1927,18 +3408,27 @@ final class FlightModel {
                     sourcePlanetName: pickup.sourcePlanetName,
                     sourcePlanetKind: pickup.sourcePlanetKind,
                     quantity: 1,
-                    processedElementName: nil
+                    processedElementName:
+                        pickup.category == .element
+                            ? pickup.materialName
+                            : nil,
+                    relicCanOpen: pickup.relicCanOpen,
+                    moduleID: pickup.moduleID,
+                    blueprintID: pickup.blueprintID
                 )
             )
+        }
+        if pickup.relicCanOpen,
+           let index = inventoryItems.firstIndex(where: { $0.id == itemID }) {
+            inventoryItems[index].relicCanOpen = true
         }
         switch pickup.category {
         case .log:
             collectedLogs[pickup.materialName, default: 0] += 1
         case .mineral:
             collectedMinerals[pickup.materialName, default: 0] += 1
-        case .electronic:
-            break
-        case .creatureMaterial:
+        case .electronic, .creatureMaterial, .relic, .relicKey,
+            .element, .blueprint, .module:
             break
         }
         collectedSurfaceItems += 1
@@ -2041,6 +3531,19 @@ final class FlightModel {
         securedLocationIdentifier = checkpoint.targetIdentifier
         securedLocationKind = checkpoint.targetKind
         securedLocationName = checkpoint.targetName
+        if !checkpoint.isLanded,
+           checkpoint.targetKind == .station,
+           let station = universeStreamer?.destination(
+                identifiedBy: checkpoint.targetIdentifier,
+                to: checkpoint.playerPosition.position
+           ) {
+            dockedStationHostPlanetName = station.hostPlanetName
+            dockedStationHostPlanetKind = station.hostPlanetKind
+            dockedStationSpecialty = station.specialtyFamily
+            dockedStationSystemSector = station.systemSector
+        } else {
+            clearDockedStationTradeContext()
+        }
         dominantHandName = checkpoint.dominantHandName ?? "—"
         playerHealth = checkpoint.playerHealth ?? 20
         roverShield = checkpoint.roverShield ?? 60
@@ -2066,6 +3569,9 @@ final class FlightModel {
         }
 
         cockpitEntity?.isEnabled = false
+        synchronizeTrueForwardParent()
+        trueForwardReferenceEntity?.isEnabled =
+            activeExplorationMode == "Deploy rover"
         landedShipPosition =
             checkpoint.landedShipPosition?.position
                 ?? playerPosition
@@ -2092,6 +3598,9 @@ final class FlightModel {
                 activeExplorationMode == "Leave on foot"
                     && surfaceRoverPosition != nil
             playerPosition = savedPlayerPosition
+            // Old checkpoints may sit on a prior perspective-scale shell.
+            // Snap player + vehicles onto the active exploration radius.
+            reprojectSurfaceActorsOntoShell()
             explorationHeading =
                 simd_length_squared(checkpoint.explorationHeading.vector)
                     > 0.001
@@ -2130,9 +3639,8 @@ final class FlightModel {
                 collectedLogs[item.materialName, default: 0] += item.quantity
             case .mineral:
                 collectedMinerals[item.materialName, default: 0] += item.quantity
-            case .electronic:
-                break
-            case .creatureMaterial:
+            case .electronic, .creatureMaterial, .relic, .relicKey,
+                .element, .blueprint, .module:
                 break
             }
         }
@@ -2144,10 +3652,13 @@ final class FlightModel {
     private func persistInventory(defaults: UserDefaults = .standard) {
         let snapshot = InventorySnapshot(
             items: inventoryItems,
-            equippedItemID: equippedInventoryItemID
+            equippedItemID: equippedInventoryItemID,
+            credits: credits,
+            progression: makeProgressionSnapshot()
         )
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         defaults.set(data, forKey: Self.inventoryStorageKey)
+        defaults.set(credits, forKey: Self.creditsStorageKey)
     }
 
     private func updateHeldInventoryItemVisual() {
@@ -2169,8 +3680,11 @@ final class FlightModel {
 
         guard let item else { return }
         let color: UIColor = switch item.category {
-        case .electronic:
+        case .electronic, .module, .blueprint:
             .systemGreen
+        case .relic: .systemYellow
+        case .relicKey: .systemPurple
+        case .element: .systemMint
         case .log, .mineral, .creatureMaterial:
             switch item.sourcePlanetKind {
             case .ocean:
@@ -2201,6 +3715,58 @@ final class FlightModel {
         hasWalkingFacingDirection = true
     }
 
+    /// Seated pinch-drag: yaw the forward / compass heading and keep it.
+    /// Positive radians turns facing to the right.
+    func applySeatedViewYaw(_ radians: Float) {
+        guard abs(radians) > 1e-6 else { return }
+
+        if isSurfaceExploration,
+           let world = universeStreamer?.nearestDestination(
+            to: playerPosition,
+            matching: .world
+           ),
+           world.distance > 0.001 {
+            let surfaceUp = -simd_normalize(world.vector)
+            let yaw = simd_quatf(angle: -radians, axis: surfaceUp)
+            if activeExplorationMode == "Deploy rover" {
+                explorationHeading = simd_normalize(
+                    yaw.act(explorationHeading)
+                )
+                let right = simd_normalize(
+                    simd_cross(explorationHeading, surfaceUp)
+                )
+                let basis = simd_float3x3(
+                    columns: (right, surfaceUp, -explorationHeading)
+                )
+                playerAttitude = simd_normalize(simd_quatf(basis))
+            } else {
+                playerAttitude = simd_normalize(yaw * playerAttitude)
+                explorationHeading = simd_normalize(
+                    yaw.act(
+                        explorationHeading
+                            - surfaceUp
+                                * simd_dot(explorationHeading, surfaceUp)
+                    )
+                )
+            }
+            explorationHeadingDegrees = atan2(
+                simd_dot(explorationHeading, explorationEast),
+                simd_dot(explorationHeading, explorationNorth)
+            ) * 180 / .pi
+            if explorationHeadingDegrees < 0 {
+                explorationHeadingDegrees += 360
+            }
+            displayedExplorationHeadingDegrees = explorationHeadingDegrees
+        } else {
+            let up = simd_normalize(
+                playerAttitude.act(SIMD3<Float>(0, 1, 0))
+            )
+            let yaw = simd_quatf(angle: -radians, axis: up)
+            playerAttitude = simd_normalize(yaw * playerAttitude)
+        }
+        applyCameraTransform()
+    }
+
     func leaveRover() {
         guard activeExplorationMode == "Deploy rover" else { return }
         explorationForwardInput = 0
@@ -2210,7 +3776,8 @@ final class FlightModel {
         activeExplorationMode = "Leave on foot"
         walkingRecoveryUsesRover = true
         walkingGestureActive = false
-        surfaceStepHeight = 0
+        resetWalkingLocomotionBoosts()
+        trueForwardReferenceEntity?.isEnabled = false
         // Enable the parked-rover collision at its saved position, then move
         // the player to the clearest side exit instead of leaving the player
         // centered on top of the rover.
@@ -2264,8 +3831,13 @@ final class FlightModel {
         explorationForwardInput = 0
         explorationTurnInput = 0
         explorationTravelSpeed = 0
-        playerPosition = roverPosition
+        playerPosition =
+            universeStreamer?.reprojectOntoSurfaceShell(roverPosition)
+            ?? roverPosition
+        surfaceRoverPosition = playerPosition
         activeExplorationMode = "Deploy rover"
+        synchronizeTrueForwardParent()
+        trueForwardReferenceEntity?.isEnabled = true
         initializeExplorationHeading()
         updateSurfaceNavigation()
         updateSurfaceVehicleMarkers()
@@ -2284,7 +3856,159 @@ final class FlightModel {
         securedLocationKind = target.kind
         securedLocationName = target.name
         nearbyInteractionTarget = target
+        if !landed, target.kind == .station {
+            dockedStationHostPlanetName = target.hostPlanetName
+            dockedStationHostPlanetKind = target.hostPlanetKind
+            dockedStationSpecialty = target.specialtyFamily
+            dockedStationSystemSector = target.systemSector
+        } else {
+            clearDockedStationTradeContext()
+        }
         persistLocationCheckpoint()
+    }
+
+    private func clearDockedStationTradeContext() {
+        dockedStationHostPlanetName = nil
+        dockedStationHostPlanetKind = nil
+        dockedStationSpecialty = nil
+        dockedStationSystemSector = nil
+    }
+
+    var dockedStationSpecialtyLabel: String {
+        guard isDocked, securedLocationKind == .station else {
+            return ""
+        }
+        let family =
+            dockedStationSpecialty?.displayName
+            ?? "General cargo"
+        let host = dockedStationHostPlanetName ?? "unknown world"
+        return "Specialty: \(family) • Host: \(host)"
+    }
+
+    var stationTradeOffers: [StationTradeOffer] {
+        guard isDocked, securedLocationKind == .station else { return [] }
+        return inventoryItems.map { item in
+            let origin = StationTradePricing.buyOrigin(
+                itemSourcePlanetIdentifier: item.sourcePlanetIdentifier,
+                itemSourcePlanetName: item.sourcePlanetName,
+                hostPlanetIdentifier: nil,
+                hostPlanetName: dockedStationHostPlanetName,
+                stationSystemSector: dockedStationSystemSector,
+                itemSystemSector: Self.systemSector(
+                    fromBodyIdentifier: item.sourcePlanetIdentifier
+                )
+            )
+            let unitPrice = StationTradePricing.unitBuyPrice(
+                category: item.category,
+                origin: origin
+            )
+            return StationTradeOffer(
+                id: item.id,
+                item: item,
+                origin: origin,
+                unitPrice: unitPrice
+            )
+        }
+        .sorted {
+            if $0.origin.label != $1.origin.label {
+                return $0.origin.label < $1.origin.label
+            }
+            return $0.item.displayName < $1.item.displayName
+        }
+    }
+
+    @discardableResult
+    func sellInventoryItem(_ itemID: String, quantity: Int = 1) -> Bool {
+        guard isDocked,
+              securedLocationKind == .station,
+              isTradeConcourseActive,
+              quantity > 0,
+              let index = inventoryItems.firstIndex(where: { $0.id == itemID })
+        else {
+            interactionStatus = "Open the trade concourse while docked to sell"
+            return false
+        }
+        let item = inventoryItems[index]
+        let sellCount = min(quantity, item.quantity)
+        guard sellCount > 0 else { return false }
+        let origin = StationTradePricing.buyOrigin(
+            itemSourcePlanetIdentifier: item.sourcePlanetIdentifier,
+            itemSourcePlanetName: item.sourcePlanetName,
+            hostPlanetIdentifier: nil,
+            hostPlanetName: dockedStationHostPlanetName,
+            stationSystemSector: dockedStationSystemSector,
+            itemSystemSector: Self.systemSector(
+                fromBodyIdentifier: item.sourcePlanetIdentifier
+            )
+        )
+        let unitPrice = StationTradePricing.unitBuyPrice(
+            category: item.category,
+            origin: origin
+        )
+        let payout = unitPrice * sellCount
+        credits += payout
+        if item.quantity <= sellCount {
+            let removedID = inventoryItems[index].id
+            inventoryItems.remove(at: index)
+            if equippedInventoryItemID == removedID {
+                equippedInventoryItemID = nil
+                updateHeldInventoryItemVisual()
+            }
+        } else {
+            inventoryItems[index].quantity -= sellCount
+        }
+        rebuildCollectedItemCounts()
+        persistInventory()
+        interactionStatus =
+            "Sold \(sellCount)× \(item.displayName) for "
+            + ProgressionEconomy.formatMon(payout)
+            + " (\(origin.label))"
+        return true
+    }
+
+    func sellAllTradeInventory() {
+        guard isDocked,
+              securedLocationKind == .station,
+              isTradeConcourseActive else {
+            interactionStatus = "Open the trade concourse while docked to sell"
+            return
+        }
+        let offers = stationTradeOffers
+        guard !offers.isEmpty else {
+            interactionStatus = "No cargo to sell"
+            return
+        }
+        var total = 0
+        for offer in offers {
+            let payout = offer.totalPrice
+            credits += payout
+            total += payout
+            inventoryItems.removeAll { $0.id == offer.id }
+        }
+        if let equipped = equippedInventoryItemID,
+           !inventoryItems.contains(where: { $0.id == equipped }) {
+            equippedInventoryItemID = nil
+            updateHeldInventoryItemVisual()
+        }
+        rebuildCollectedItemCounts()
+        persistInventory()
+        interactionStatus =
+            "Sold all cargo for \(ProgressionEconomy.formatMon(total))"
+    }
+
+    private static func systemSector(
+        fromBodyIdentifier identifier: String
+    ) -> GalacticSector? {
+        let head = identifier.split(separator: ":", maxSplits: 1).first
+        guard let head else { return nil }
+        let parts = head.split(separator: ",")
+        guard parts.count == 3,
+              let x = Int64(parts[0]),
+              let y = Int64(parts[1]),
+              let z = Int64(parts[2]) else {
+            return nil
+        }
+        return GalacticSector(x: x, y: y, z: z)
     }
 
     func performContextAction() {
@@ -2298,6 +4022,11 @@ final class FlightModel {
             isDocked = false
             securedLocationKind = nil
             securedLocationName = nil
+            clearDockedStationTradeContext()
+            if isTradeConcourseActive {
+                activeExplorationMode = nil
+                cockpitEntity?.isEnabled = true
+            }
             interactionStatus = "Undocked"
             contextActionTitle = nil
             contextActionEnabled = false
@@ -2314,33 +4043,102 @@ final class FlightModel {
             contextActionEnabled = true
         case .wreckage:
             universeStreamer?.investigateWreckage(target.identifier)
-            interactionStatus = "Examined \(target.name)"
+            // Debris salvage: chance at a progression module/blueprint.
+            let salvage = Int.random(in: 0...99)
+            if salvage < 25 {
+                ownedBlueprintIDs.insert(
+                    ProgressionEconomy.analyzerBlueprintID
+                )
+                interactionStatus =
+                    "Examined \(target.name) • Analyzer blueprint"
+            } else if salvage < 45 {
+                applyModuleUnlock("module.slicer")
+                interactionStatus =
+                    "Examined \(target.name) • Sonic Slicer module"
+            } else if salvage < 55 {
+                applyModuleUnlock("module.crumbler")
+                interactionStatus =
+                    "Examined \(target.name) • Matter Crumbler module"
+            } else {
+                interactionStatus = "Examined \(target.name)"
+            }
             contextActionTitle = "EXAMINED"
             contextActionEnabled = false
             investigatedWreckageCount =
                 universeStreamer?.investigatedWreckageCount ?? 0
+            persistInventory()
         case .world:
             break
         }
     }
 
-    func tick() {
-        let now = ContinuousClock.now
-        let duration = lastTick.duration(to: now)
-        lastTick = now
-        let dt = min(Float(duration.components.seconds) + Float(duration.components.attoseconds) / 1e18, 0.05)
+    func setHandTrackingStatus(_ status: String) {
+        guard handTrackingStatus != status else { return }
+        handTrackingStatus = status
+    }
+
+    func setDominantHandActive(_ active: Bool) {
+        guard dominantHandActive != active else { return }
+        dominantHandActive = active
+    }
+
+    func setSupportHandActive(_ active: Bool) {
+        guard supportHandActive != active else { return }
+        supportHandActive = active
+    }
+
+    func setInteractionStatus(_ status: String) {
+        guard interactionStatus != status else { return }
+        interactionStatus = status
+    }
+
+    private func setDamageFlashOpacity(_ value: Double) {
+        simulationDamageFlashOpacity = value
+        let quantized = (value * 20).rounded() / 20
+        if abs(damageFlashOpacity - quantized) >= 0.001 {
+            damageFlashOpacity = quantized
+        }
+    }
+
+    func tick(deltaTime externalDelta: Float? = nil) {
+        onFrameExtras?()
+        let dt: Float
+        if let externalDelta {
+            dt = min(max(externalDelta, 0), 0.05)
+            lastTick = .now
+        } else {
+            let now = ContinuousClock.now
+            let duration = lastTick.duration(to: now)
+            lastTick = now
+            dt = min(
+                Float(duration.components.seconds)
+                    + Float(duration.components.attoseconds) / 1e18,
+                0.05
+            )
+        }
         guard dt > 0 else { return }
-        damageFlashOpacity = max(
-            0,
-            damageFlashOpacity - Double(dt) * 1.7
+        setDamageFlashOpacity(
+            max(0, simulationDamageFlashOpacity - Double(dt) * 1.7)
         )
+        let boostActive = atmosphericBoostBlend > 0.01
+        if isAtmosphericBoostActive != boostActive {
+            isAtmosphericBoostActive = boostActive
+        }
         if gameOverTitle != nil {
             updateGameOver(dt: dt)
             return
         }
+        // Single-player pause: settings gear is the only pause entry.
+        if isPaused {
+            updateCockpitVisuals(dt: dt)
+            updateRelicKeyLocator()
+            return
+        }
         updateCockpitVisuals(dt: dt)
+        burnShipFuel(dt: dt)
         updateWeaponEffects(dt: dt)
         updateSurfaceProjectiles(dt: dt)
+        updateRelicKeyLocator()
         updateFlightEnvironment(dt: dt)
         if isWithinPlanetAtmosphere
             && (isBoosting || isHyperDriveCharging) {
@@ -2412,7 +4210,9 @@ final class FlightModel {
         let yawRotation = simd_quatf(angle: yaw * turnRate * dt, axis: SIMD3<Float>(0, 1, 0))
         let rollRotation = simd_quatf(angle: roll * turnRate * dt, axis: SIMD3<Float>(0, 0, 1))
         playerAttitude = simd_normalize(playerAttitude * yawRotation * pitchRotation * rollRotation)
-        applyAtmosphericAutoUpright(dt: dt)
+        // Capture radial-up before travel so hands-free atmosphere flight can
+        // rotate attitude by the same arc the planet curve advances.
+        let previousSurfaceUp = surfaceUpDirection
 
         let forward = playerAttitude.act(SIMD3<Float>(0, 0, -1))
         if isBoosting {
@@ -2458,6 +4258,11 @@ final class FlightModel {
         }
         let delta = constrainToPlanetSurface(solidConstraint.delta)
         playerPosition.translate(by: SIMD3<Double>(delta))
+        applyAtmosphericTravelCurvature(
+            previousUp: previousSurfaceUp,
+            traveledDelta: delta
+        )
+        applyAtmosphericAutoUpright(dt: dt)
         universeStreamer?.update(around: playerPosition.sector)
         distanceTravelled += simd_length(delta)
         elapsedTime += TimeInterval(dt)
@@ -2644,9 +4449,12 @@ final class FlightModel {
             return
         }
 
-        let surfaceUp = -simd_normalize(world.vector)
+        // Radial before this frame's step — used so walking attitude can follow
+        // planet curvature after the move (frozen landing-up makes distant
+        // ground rise into the sky instead of sinking under the horizon).
+        let previousSurfaceUp = -simd_normalize(world.vector)
         if activeExplorationMode == "Leave on foot" {
-            updateWalkingHeading(surfaceUp: surfaceUp)
+            updateWalkingHeading(surfaceUp: previousSurfaceUp)
         }
         let turnRate: Float =
             activeExplorationMode == "Deploy rover" ? 1.35 : 1.8
@@ -2656,23 +4464,36 @@ final class FlightModel {
                 : 0
         if abs(turn) > 0.0001 {
             explorationHeading = simd_normalize(
-                simd_quatf(angle: -turn, axis: surfaceUp)
+                simd_quatf(angle: -turn, axis: previousSurfaceUp)
                     .act(explorationHeading)
             )
         }
         explorationHeading = simd_normalize(
             explorationHeading
-                - surfaceUp * simd_dot(explorationHeading, surfaceUp)
+                - previousSurfaceUp
+                    * simd_dot(explorationHeading, previousSurfaceUp)
         )
 
         let signedInput: Float =
             activeExplorationMode == "Leave on foot"
-                ? (walkingGestureActive ? 1 : 0)
+                ? max(
+                    walkingGestureActive ? 1 : 0,
+                    max(0, Float(explorationForwardInput))
+                )
                 : Float(explorationForwardInput)
+        let runMultiplier: Float =
+            activeExplorationMode == "Leave on foot"
+                && (isRunningGestureActive || controllerRunHeld)
+                ? 2
+                : 1
         explorationTravelSpeed =
             signedInput
             * explorationMaximumSpeed
+            * runMultiplier
             * (signedInput < 0 ? 0.5 : 1)
+        if activeExplorationMode == "Leave on foot" {
+            updateWalkingJetpack(deltaTime: dt)
+        }
         let proposedDelta =
             explorationHeading * explorationTravelSpeed * dt
                 + pendingSurfaceKnockback
@@ -2689,7 +4510,24 @@ final class FlightModel {
         distanceTravelled += movedDistance
         elapsedTime += TimeInterval(dt)
 
-        if activeExplorationMode == "Deploy rover" {
+        let surfaceUp: SIMD3<Float>
+        if let worldAfter = universeStreamer?.nearestDestination(
+            to: playerPosition,
+            matching: .world
+        ), worldAfter.distance > 0.001 {
+            surfaceUp = -simd_normalize(worldAfter.vector)
+        } else {
+            surfaceUp = previousSurfaceUp
+        }
+
+        if activeExplorationMode == "Leave on foot" {
+            // Keep headset free-look, but rotate attitude by the same radial
+            // arc just walked so the horizon curves over near ground first.
+            applySurfaceTravelCurvature(
+                from: previousSurfaceUp,
+                to: surfaceUp
+            )
+        } else if activeExplorationMode == "Deploy rover" {
             let right = simd_normalize(
                 simd_cross(explorationHeading, surfaceUp)
             )
@@ -2698,6 +4536,10 @@ final class FlightModel {
             )
             playerAttitude = simd_normalize(simd_quatf(basis))
         }
+        explorationHeading = simd_normalize(
+            explorationHeading
+                - surfaceUp * simd_dot(explorationHeading, surfaceUp)
+        )
         explorationHeadingDegrees = atan2(
             simd_dot(explorationHeading, explorationEast),
             simd_dot(explorationHeading, explorationNorth)
@@ -2709,9 +4551,22 @@ final class FlightModel {
         applyCameraTransform()
 
         checkpointSaveAccumulator += dt
-        if checkpointSaveAccumulator >= 1 {
+        if checkpointSaveAccumulator >= 4 {
             checkpointSaveAccumulator = 0
-            persistLocationCheckpoint()
+            let movedFarEnough: Bool = {
+                guard let last = lastCheckpointPlayerPosition else {
+                    return true
+                }
+                let delta = playerPosition.vector(
+                    to: last.sector,
+                    local: last.local
+                )
+                return simd_length(delta) > 2
+            }()
+            if movedFarEnough {
+                lastCheckpointPlayerPosition = playerPosition
+                persistLocationCheckpoint()
+            }
         }
 
         telemetryAccumulator += TimeInterval(dt)
@@ -2728,6 +4583,22 @@ final class FlightModel {
             facing - surfaceUp * simd_dot(facing, surfaceUp)
         guard simd_length_squared(tangent) > 0.001 else { return }
         explorationHeading = simd_normalize(tangent)
+    }
+
+    /// On-foot: rotate view attitude by the radial change from walking so
+    /// distant props fall under the horizon instead of climbing the sky.
+    private func applySurfaceTravelCurvature(
+        from previousUp: SIMD3<Float>,
+        to newUp: SIMD3<Float>
+    ) {
+        let alignment = max(-1, min(1, simd_dot(previousUp, newUp)))
+        guard alignment < 0.999999 else { return }
+        var axis = simd_cross(previousUp, newUp)
+        let axisLength = simd_length(axis)
+        guard axisLength > 1e-8 else { return }
+        axis /= axisLength
+        let curvature = simd_quatf(angle: acos(alignment), axis: axis)
+        playerAttitude = simd_normalize(curvature * playerAttitude)
     }
 
     @discardableResult
@@ -2760,9 +4631,14 @@ final class FlightModel {
         if surfaceConstraint.stepHeight >= surfaceStepHeight {
             surfaceStepHeight = surfaceConstraint.stepHeight
         } else {
+            // Fall quickly when a walkable prop underfoot is removed.
+            let fallRate: Float =
+                surfaceConstraint.stepHeight + 0.08 < surfaceStepHeight
+                ? 16
+                : 4.2
             surfaceStepHeight = max(
                 surfaceConstraint.stepHeight,
-                surfaceStepHeight - 4.2 * deltaTime
+                surfaceStepHeight - fallRate * deltaTime
             )
         }
         let vectorAfterMove = world.vector - safeDelta
@@ -2773,6 +4649,7 @@ final class FlightModel {
                 + UniverseScale.surfaceEyeHeight
                 + localTerrainElevation
                 + surfaceStepHeight
+                + surfaceJetpackAltitude
         let correctedVectorToCenter =
             simd_normalize(vectorAfterMove) * surfaceDistance
         let delta = world.vector - correctedVectorToCenter
@@ -2783,6 +4660,50 @@ final class FlightModel {
             deltaTime: deltaTime
         )
         return simd_length(delta)
+    }
+
+    private func updateWalkingJetpack(deltaTime: Float) {
+        let maxFuel = Self.jetpackFuelCapacity
+        let riseSpeed: Float = 3.4
+        let slowFallSpeed: Float = 1.6
+        let gravity: Float = 6.5
+
+        if isJetpackThrusting, surfaceJetpackFuel > 0 {
+            let burn = min(deltaTime, surfaceJetpackFuel)
+            surfaceJetpackFuel -= burn
+            surfaceJetpackVelocity = riseSpeed
+            surfaceJetpackAltitude += riseSpeed * burn
+            if surfaceJetpackFuel <= 0 {
+                isJetpackThrusting = false
+            }
+        } else if surfaceJetpackAltitude > 0 {
+            surfaceJetpackVelocity = max(
+                -slowFallSpeed,
+                surfaceJetpackVelocity - gravity * deltaTime
+            )
+            surfaceJetpackAltitude = max(
+                0,
+                surfaceJetpackAltitude + surfaceJetpackVelocity * deltaTime
+            )
+            if surfaceJetpackAltitude <= 0 {
+                surfaceJetpackAltitude = 0
+                surfaceJetpackVelocity = 0
+            }
+        } else {
+            surfaceJetpackVelocity = 0
+            // Refuel only when grounded and not thrusting.
+            if !isJetpackThrusting {
+                surfaceJetpackFuel = min(
+                    maxFuel,
+                    surfaceJetpackFuel + deltaTime * 0.85
+                )
+            }
+        }
+        if abs(displayedJetpackFuel - surfaceJetpackFuel) >= 0.05
+            || (surfaceJetpackFuel >= maxFuel - 0.001
+                && displayedJetpackFuel < maxFuel) {
+            displayedJetpackFuel = surfaceJetpackFuel
+        }
     }
 
     private func updateSurfaceNavigation() {
@@ -2809,13 +4730,43 @@ final class FlightModel {
         }
     }
 
+    /// Keeps saved/on-foot actors on the same walkable shell as markers.
+    private func reprojectSurfaceActorsOntoShell() {
+        if let projected = universeStreamer?.reprojectOntoSurfaceShell(
+            playerPosition
+        ) {
+            playerPosition = projected
+        }
+        if let ship = surfaceShipPosition,
+           let projected = universeStreamer?.reprojectOntoSurfaceShell(
+            ship
+           ) {
+            surfaceShipPosition = projected
+        }
+        if let rover = surfaceRoverPosition,
+           let projected = universeStreamer?.reprojectOntoSurfaceShell(
+            rover
+           ) {
+            surfaceRoverPosition = projected
+        }
+    }
+
     private func surfaceNavigation(
         to target: GalacticPosition
     ) -> (distance: Float, relativeBearing: Float) {
+        // Compare on the active exploration shell so a stale radial scale
+        // (e.g. checkpoint from surfacePerspectiveScale 24 vs 6) cannot
+        // inflate distance and hide the enter-ship / enter-rover prompt.
+        let from =
+            universeStreamer?.reprojectOntoSurfaceShell(playerPosition)
+            ?? playerPosition
+        let to =
+            universeStreamer?.reprojectOntoSurfaceShell(target)
+            ?? target
         let vector = SIMD3<Float>(
-            playerPosition.vector(
-                to: target.sector,
-                local: target.local
+            from.vector(
+                to: to.sector,
+                local: to.local
             )
         )
         let distance = simd_length(vector)
@@ -2844,28 +4795,32 @@ final class FlightModel {
 
     private func updateFlightEnvironment(dt: Float) {
         isWithinPlanetAtmosphere = false
-        if isLanded {
-            let landedWorld = universeStreamer?.nearestDestination(
+        if isLanded || isDocked {
+            let securedWorld = universeStreamer?.nearestDestination(
                 to: playerPosition,
                 matching: .world
             )
             isWithinPlanetAtmosphere =
-                landedWorld?.hasAtmosphere == true
+                isLanded && securedWorld?.hasAtmosphere == true
             environmentStatus =
-                landedWorld?.hasAtmosphere == true
-                    ? "LANDED • ATMOSPHERE"
-                    : "LANDED • AIRLESS"
+                isDocked
+                    ? "DOCKED"
+                    : (securedWorld?.hasAtmosphere == true
+                        ? "LANDED • ATMOSPHERE"
+                        : "LANDED • AIRLESS")
             atmosphericSpeedLimit = 0
             atmosphereHazeOpacity =
-                landedWorld?.hasAtmosphere == true ? 0.96 : 0
+                isLanded && securedWorld?.hasAtmosphere == true ? 0.12 : 0
             updateAtmosphereEnvironment(
-                for: landedWorld,
-                skyOpacity: landedWorld?.hasAtmosphere == true ? 0.96 : 0,
-                lightStrength: landedWorld?.hasAtmosphere == true ? 1 : 0,
-                showSky: true
+                for: isLanded ? securedWorld : nil,
+                skyOpacity: isLanded && securedWorld?.hasAtmosphere == true
+                    ? 0.12 : 0,
+                lightStrength: isLanded && securedWorld?.hasAtmosphere == true
+                    ? 1 : 0,
+                showSky: isLanded
             )
             surfaceUpDirection = nil
-            nearbyWorldForEnvironment = landedWorld
+            nearbyWorldForEnvironment = isLanded ? securedWorld : nil
             starHeat = max(0, starHeat - dt * 20)
             return
         }
@@ -2963,15 +4918,14 @@ final class FlightModel {
             let surfaceLimit = maximumForwardSpeed * 0.175
             atmosphericSpeedLimit =
                 dogfightLimit + (surfaceLimit - dogfightLimit) * lowerDepth
-            let lowerSkyOpacity =
-                lowerAtmosphereSkyOpacity(for: world.celestialKind)
-            let skyOpacity =
-                lowerSkyOpacity * (0.72 + lowerDepth * 0.28)
+            // Lower atmosphere stays visually clear so surface landmarks,
+            // ships, and terrain remain easy to read while flying.
+            let skyOpacity = 0.045 + (1 - lowerDepth) * 0.055
             atmosphereHazeOpacity = Double(skyOpacity)
             updateAtmosphereEnvironment(
                 for: world,
                 skyOpacity: skyOpacity,
-                lightStrength: 0.68 + lowerDepth * 0.32,
+                lightStrength: 0.88 + lowerDepth * 0.12,
                 showSky: true
             )
             environmentStatus = "LOW ATMOSPHERE"
@@ -2983,12 +4937,14 @@ final class FlightModel {
             // Upper-atmosphere flight is exactly twice the lower-atmosphere
             // entry limit, while still preventing hyperdrive near a planet.
             atmosphericSpeedLimit = maximumForwardSpeed
-            atmosphereHazeOpacity = 0
+            // Foggy veil that still lets the pilot read continents below.
+            let skyOpacity = 0.14 + upperProgress * 0.20
+            atmosphereHazeOpacity = Double(skyOpacity)
             updateAtmosphereEnvironment(
                 for: world,
-                skyOpacity: 0,
-                lightStrength: upperProgress * 0.60,
-                showSky: false
+                skyOpacity: skyOpacity,
+                lightStrength: 0.32 + upperProgress * 0.34,
+                showSky: true
             )
             environmentStatus = "UPPER ATMOSPHERE"
         }
@@ -3074,23 +5030,6 @@ final class FlightModel {
         }
     }
 
-    private func lowerAtmosphereSkyOpacity(
-        for kind: CelestialBodyKind?
-    ) -> Float {
-        switch kind {
-        case .ocean, .ice:
-            0.98
-        case .desert:
-            0.94
-        case .rocky:
-            0.90
-        case .gas:
-            0.84
-        case .star, nil:
-            0
-        }
-    }
-
     private func constrainToPlanetSurface(
         _ proposedDelta: SIMD3<Float>
     ) -> SIMD3<Float> {
@@ -3153,6 +5092,48 @@ final class FlightModel {
         return constrainedDelta
     }
 
+    /// Hands-free atmosphere flight: rotate attitude by the same radial arc
+    /// the ship just traveled so horizon follow matches distance, not a
+    /// lagged chase that jitters across the planet face.
+    private func applyAtmosphericTravelCurvature(
+        previousUp: SIMD3<Float>?,
+        traveledDelta: SIMD3<Float>
+    ) {
+        guard !dominantHandActive,
+              let previousUp,
+              let world = nearbyWorldForEnvironment,
+              world.celestialKind != .star,
+              world.distance > 0.001,
+              simd_length_squared(traveledDelta) > 1e-10
+        else { return }
+
+        // `world.vector` is ship→center from the pre-move sample.
+        let newVector = world.vector - traveledDelta
+        let newDistance = simd_length(newVector)
+        guard newDistance > 0.001 else { return }
+        let newUp = -newVector / newDistance
+
+        let alignment = max(-1, min(1, simd_dot(previousUp, newUp)))
+        guard alignment < 0.999999 else {
+            surfaceUpDirection = newUp
+            return
+        }
+
+        var axis = simd_cross(previousUp, newUp)
+        let axisLength = simd_length(axis)
+        guard axisLength > 1e-8 else {
+            surfaceUpDirection = newUp
+            return
+        }
+        axis /= axisLength
+        let angle = acos(alignment)
+        let curvature = simd_quatf(angle: angle, axis: axis)
+        playerAttitude = simd_normalize(curvature * playerAttitude)
+        surfaceUpDirection = newUp
+    }
+
+    /// Soft residual bank/pitch cleanup after stick release. Curvature is
+    /// already matched to travel; this only eases leftover roll gently.
     private func applyAtmosphericAutoUpright(dt: Float) {
         guard !dominantHandActive, let surfaceUpDirection else { return }
 
@@ -3161,7 +5142,8 @@ final class FlightModel {
         )
         let alignment = max(-1, min(1, simd_dot(currentUp, surfaceUpDirection)))
         let remainingAngle = acos(alignment)
-        guard remainingAngle > 0.001 else { return }
+        // Deadzone so tiny numerical drift never ticks the camera.
+        guard remainingAngle > 0.004 else { return }
 
         var axis = simd_cross(currentUp, surfaceUpDirection)
         if simd_length_squared(axis) < 0.0001 {
@@ -3169,10 +5151,12 @@ final class FlightModel {
         } else {
             axis = simd_normalize(axis)
         }
-        let correction = simd_quatf(
-            angle: min(remainingAngle, dt * 0.9),
-            axis: axis
-        )
+        // Forgiving ease: proportional to remaining error, hard-capped so
+        // recovery never feels snappy or stepped.
+        let easeRate: Float = 1.1
+        let maxRate: Float = 0.32
+        let step = min(remainingAngle, remainingAngle * easeRate * dt, maxRate * dt)
+        let correction = simd_quatf(angle: step, axis: axis)
         playerAttitude = simd_normalize(correction * playerAttitude)
     }
 
@@ -3211,23 +5195,58 @@ final class FlightModel {
         }
     }
 
-    /// Keeps the ship-forward cue on the ship's centerline at the pilot's
-    /// current eye height. Unlike the head-aimed weapon sight, the cue does
-    /// not inherit head rotation, so looking around still reveals the actual
-    /// direction of the nose.
+    /// Keeps the ship/rover-forward cue on the vehicle centerline at the
+    /// pilot's current eye height. Unlike the head-aimed weapon sight, the
+    /// cue does not inherit head rotation, so looking around still reveals
+    /// the actual direction of the nose.
     private func updateTrueForwardReference() {
-        guard let cockpitEntity,
-              let trueForwardReferenceEntity,
+        guard let trueForwardReferenceEntity,
               let aimAnchorEntity else { return }
-        let eyePosition = aimAnchorEntity.position(relativeTo: cockpitEntity)
+        let showForwardCue =
+            !isRefineryPresented
+                && !isStationShopPresented
+                && (!isOutsideShip
+                    || activeExplorationMode == "Deploy rover")
+        trueForwardReferenceEntity.isEnabled = showForwardCue
+        guard showForwardCue else { return }
+
+        // Cockpit is disabled in rover mode; keep the cue on an always-on
+        // vehicle frame (cockpit parent / scene root) so terrain cannot hide
+        // it by disabling the cockpit hierarchy.
+        synchronizeTrueForwardParent()
+        guard let frame = trueForwardReferenceEntity.parent else { return }
+        let eyePosition = aimAnchorEntity.position(relativeTo: frame)
         trueForwardReferenceEntity.position =
             eyePosition + SIMD3<Float>(0, 0, -1.55)
     }
 
+    private func synchronizeTrueForwardParent() {
+        guard let trueForwardReferenceEntity,
+              let cockpitEntity else { return }
+        let wantsCockpitParent = cockpitEntity.isEnabled
+        if wantsCockpitParent {
+            if trueForwardReferenceEntity.parent !== cockpitEntity {
+                cockpitEntity.addChild(trueForwardReferenceEntity)
+            }
+            return
+        }
+        guard activeExplorationMode == "Deploy rover",
+              let vehicleFrame = cockpitEntity.parent else {
+            return
+        }
+        if trueForwardReferenceEntity.parent !== vehicleFrame {
+            vehicleFrame.addChild(trueForwardReferenceEntity)
+        }
+    }
+
     private func updateWeaponReticleVisual() {
         guard let weaponReticleEntity else { return }
+        let hideForModal =
+            weaponReticleSuppressed
+                || isRefineryPresented
+                || isStationShopPresented
         weaponReticleEntity.isEnabled =
-            !isOutsideShip && !weaponReticleSuppressed
+            !isOutsideShip && !hideForModal
         guard lastReticleWeaponIndex != currentWeaponIndex else { return }
 
         let color: UIColor = switch currentWeaponType {
@@ -3364,13 +5383,29 @@ final class FlightModel {
 
     private func applyCameraTransform() {
         universeStreamer?.updateRenderOrigin(around: playerPosition)
+        universeStreamer?.updateSurfaceDetailVisibility(
+            around: playerPosition,
+            showGroundDetail: isOutsideShip
+        )
         universeRoot?.orientation = playerAttitude.inverse
         universeRoot?.position = .zero
     }
 
     private func updateTelemetry() {
+        displayedTravelSpeed = travelSpeed
+        displayedExplorationTravelSpeed = explorationTravelSpeed
+        displayedExplorationHeadingDegrees = explorationHeadingDegrees
+        if abs(displayedDistanceTravelled - distanceTravelled) >= 1 {
+            displayedDistanceTravelled = distanceTravelled
+        }
+        if abs(displayedElapsedTime - elapsedTime) >= 0.2 {
+            displayedElapsedTime = elapsedTime
+        }
         let sector = playerPosition.sector
-        currentRegion = "\(sector.x), \(sector.y), \(sector.z)"
+        let regionLabel = "\(sector.x), \(sector.y), \(sector.z)"
+        if currentRegion != regionLabel {
+            currentRegion = regionLabel
+        }
         visitedSectorCount = universeStreamer?.visitedSectorCount ?? 0
         discoveredBodyCount = universeStreamer?.discoveredBodyCount ?? 0
         discoveredPointOfInterestCount =
@@ -3383,8 +5418,14 @@ final class FlightModel {
         )
         updateTargetContacts()
         guard let destination = universeStreamer?.nearestDestination(to: playerPosition) else { return }
-        nearestObject = "\(destination.kind.displayName) • \(destination.name)"
-        nearestDistance = destination.distance
+        let objectLabel =
+            "\(destination.kind.displayName) • \(destination.name)"
+        if nearestObject != objectLabel {
+            nearestObject = objectLabel
+        }
+        if abs(nearestDistance - destination.distance) >= 1 {
+            nearestDistance = destination.distance
+        }
         updateProximity(to: destination)
     }
 
@@ -3447,5 +5488,49 @@ final class FlightModel {
         default:
             interactionStatus = ""
         }
+    }
+
+    private func updateRelicKeyLocator() {
+        let holdingKey = equippedInventoryItem?.isRelicKey == true
+            && activeExplorationMode == "Leave on foot"
+        guard holdingKey,
+              let held = heldInventoryItemEntity,
+              let sceneRoot = held.parent,
+              let aim = universeStreamer?.nearestRelicDirection(
+                from: held.position(relativeTo: nil)
+              ) else {
+            relicLocatorEntity?.removeFromParent()
+            relicLocatorEntity = nil
+            return
+        }
+        let line: Entity
+        if let existing = relicLocatorEntity {
+            line = existing
+        } else {
+            var material = UnlitMaterial(
+                color: UIColor.systemPurple.withAlphaComponent(0.85)
+            )
+            material.blending = .transparent(opacity: .init(floatLiteral: 0.85))
+            let created = ModelEntity(
+                mesh: .generateCylinder(height: 3.0, radius: 0.008),
+                materials: [material]
+            )
+            created.name = "Relic Key Locator Beam"
+            sceneRoot.addChild(created)
+            relicLocatorEntity = created
+            line = created
+        }
+        let origin = held.position(relativeTo: nil)
+        let direction = aim
+        let tip = origin + direction * 1.5
+        line.position = sceneRoot.convert(position: tip, from: nil)
+        let localAim = simd_normalize(
+            sceneRoot.convert(direction: direction, from: nil)
+        )
+        line.orientation = simd_quatf(
+            from: SIMD3<Float>(0, 1, 0),
+            to: localAim
+        )
+        line.isEnabled = true
     }
 }

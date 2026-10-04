@@ -112,16 +112,6 @@ struct ImmersiveSpaceView: View {
                 )
                 viewAnchor.addChild(controls)
             }
-            if let picker = attachments.entity(for: "detectionPicker") {
-                picker.position = [0, 0, -0.72]
-                picker.components.set(
-                    ModelSortGroupComponent(
-                        group: .planarUIAlwaysInFront,
-                        order: 9_500
-                    )
-                )
-                viewAnchor.addChild(picker)
-            }
             if let contacts = attachments.entity(
                 for: "targetContactPanel"
             ) {
@@ -147,6 +137,31 @@ struct ImmersiveSpaceView: View {
                     )
                 )
                 viewAnchor.addChild(inventory)
+            }
+            if let shop = attachments.entity(for: "stationShop") {
+                // Closer than inventory (-0.78) so shop buttons stay hittable.
+                shop.position = [0, 0.04, -0.70]
+                shop.scale = SIMD3<Float>(repeating: 0.70)
+                shop.components.set(
+                    ModelSortGroupComponent(
+                        group: .planarUIAlwaysInFront,
+                        order: 9_850
+                    )
+                )
+                viewAnchor.addChild(shop)
+            }
+            if let refinery = attachments.entity(for: "refineryPanel") {
+                // Midway between top HUD (~0.40) and lower controls (~-0.36).
+                // Closer than inventory (-0.78) so CLOSE/craft stay hittable.
+                refinery.position = [0, -0.02, -0.70]
+                refinery.scale = SIMD3<Float>(repeating: 0.68)
+                refinery.components.set(
+                    ModelSortGroupComponent(
+                        group: .planarUIAlwaysInFront,
+                        order: 9_860
+                    )
+                )
+                viewAnchor.addChild(refinery)
             }
         } attachments: {
             Attachment(id: "cockpitHUD") {
@@ -176,12 +191,6 @@ struct ImmersiveSpaceView: View {
                 )
                     .environment(flight)
             }
-            Attachment(id: "detectionPicker") {
-                DetectionPicker(
-                    isPresented: $isDetectionPickerPresented
-                )
-                .environment(flight)
-            }
             Attachment(id: "targetContactPanel") {
                 ShipTargetContactHUD()
                     .environment(flight)
@@ -190,12 +199,23 @@ struct ImmersiveSpaceView: View {
                 SurfaceInventoryView()
                     .environment(flight)
             }
+            Attachment(id: "stationShop") {
+                StationShopView()
+                    .environment(flight)
+            }
+            Attachment(id: "refineryPanel") {
+                RefineryFabricatorView()
+                    .environment(flight)
+            }
         }
         .handlesGameControllerEvents(matching: .gamepad)
         .task {
             controllerObserver.connect(to: flight)
             handController.connect(to: flight)
             while !Task.isCancelled {
+                // Head pose feeds walk/kit/jetpack zone checks; yaw pinch
+                // does not need it, so missing this looks like "only turn works".
+                handController.pollDevicePose()
                 flight.tick()
                 try? await Task.sleep(for: .milliseconds(16))
             }
@@ -228,6 +248,7 @@ struct ImmersiveSpaceView: View {
 
 private struct SurfaceInventoryView: View {
     @Environment(FlightModel.self) private var flight
+    @State private var pendingDifficulty: GameDifficulty = .normal
 
     private let columns = Array(
         repeating: GridItem(.fixed(82), spacing: 8),
@@ -247,40 +268,70 @@ private struct SurfaceInventoryView: View {
     }
 
     var body: some View {
-        if flight.inventoryVisible && flight.canPresentInventory {
+        // Hide while refinery/shop owns the interaction plane — otherwise the
+        // closer inventory attachment steals pinches and the modal feels stuck.
+        if flight.inventoryVisible
+            && flight.canPresentInventory
+            && !flight.isRefineryPresented
+            && !flight.isStationShopPresented {
             VStack(alignment: .leading, spacing: 14) {
-                HStack {
-                    Label(
-                        "PLANETARY MATERIAL INVENTORY",
-                        systemImage: "shippingbox.fill"
-                    )
-                    .font(.title3.bold())
-                    Spacer()
-                    Text(
-                        "\(flight.inventoryItems.count)"
-                            + " / \(flight.inventoryCapacity) SLOTS"
-                    )
-                    .font(.headline.monospacedDigit())
-                    .foregroundStyle(.cyan)
-                }
-
-                LazyVGrid(columns: columns, spacing: 8) {
-                    ForEach(0..<flight.inventoryDemoSlotCount, id: \.self) {
-                        index in
-                        if sortedItems.indices.contains(index) {
-                            inventoryButton(sortedItems[index])
-                        } else {
-                            emptySlot(index)
+                // Top-bar menus must expand downward (below this header),
+                // never upward above the bar. See PanelMenuExpansion.
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack(alignment: .center, spacing: 12) {
+                        Label(
+                            "PLANETARY MATERIAL INVENTORY",
+                            systemImage: "shippingbox.fill"
+                        )
+                        .font(.title3.bold())
+                        Spacer()
+                        Text(ProgressionEconomy.formatMon(flight.mon))
+                            .font(.headline.monospacedDigit())
+                            .foregroundStyle(.yellow)
+                        Text(
+                            "\(flight.inventoryItems.count)"
+                                + " / \(flight.inventoryCapacity) SLOTS"
+                        )
+                        .font(.headline.monospacedDigit())
+                        .foregroundStyle(.cyan)
+                        Button {
+                            if flight.isSettingsMenuPresented {
+                                flight.closeSettingsMenu()
+                            } else {
+                                pendingDifficulty = flight.gameDifficulty
+                                flight.openSettingsMenu()
+                            }
+                        } label: {
+                            Image(
+                                systemName: flight.isSettingsMenuPresented
+                                    ? "xmark.circle.fill"
+                                    : "gearshape.fill"
+                            )
+                            .font(.title2)
+                            .foregroundStyle(
+                                flight.isSettingsMenuPresented
+                                    ? .orange : .white
+                            )
+                            .frame(width: 44, height: 44)
+                            .background(.white.opacity(0.12))
+                            .clipShape(.circle)
                         }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(
+                            flight.isSettingsMenuPresented
+                                ? "Close settings"
+                                : "Open settings"
+                        )
+                    }
+
+                    if flight.isSettingsMenuPresented {
+                        settingsPanel
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    } else {
+                        inventoryGrid
                     }
                 }
-
-                Text(
-                    "50 demo slots shown • select an item to place it"
-                        + " in your dominant hand"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .panelMenuExpansion(.topBarDrops)
             }
             .padding(20)
             .frame(width: 920)
@@ -289,18 +340,274 @@ private struct SurfaceInventoryView: View {
         }
     }
 
+    @ViewBuilder
+    private var inventoryGrid: some View {
+        LazyVGrid(columns: columns, spacing: 8) {
+            ForEach(0..<flight.inventoryDemoSlotCount, id: \.self) {
+                index in
+                if sortedItems.indices.contains(index) {
+                    inventoryButton(sortedItems[index])
+                } else {
+                    emptySlot(index)
+                }
+            }
+        }
+
+        HStack(spacing: 10) {
+            if flight.isFabricatorAvailable {
+                Button("REFINERY") { flight.openRefineryPanel() }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.mint)
+            }
+            if let equipped = flight.equippedInventoryItem {
+                if equipped.isRelic {
+                    Button("OPEN RELIC") { flight.openEquippedRelic() }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.yellow)
+                        .disabled(equipped.relicCanOpen != true)
+                }
+                if equipped.isEnergyCube {
+                    Button("USE CUBE") {
+                        flight.useEnergyCube(itemID: equipped.id)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                }
+                if flight.isFabricatorAvailable,
+                   [.log, .mineral, .electronic, .creatureMaterial, .relic]
+                    .contains(equipped.category),
+                   !equipped.isEnergyCube {
+                    Button("REFINE 1") {
+                        flight.refineInventoryItem(equipped.id)
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+            Text(
+                "Energy \(Int(flight.organicEnergy))/\(Int(flight.organicEnergyCapacity))"
+                    + " • Fuel \(Int(flight.shipFuel))"
+            )
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+
+        Text(
+            "Select to equip • Relic Key points to Relics • scan before harvest for +33%"
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder
+    private var settingsPanel: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Label("SETTINGS", systemImage: "gearshape.fill")
+                    .font(.title3.bold())
+                Spacer()
+                if flight.isPaused {
+                    Text("PAUSED")
+                        .font(.caption.bold())
+                        .foregroundStyle(.orange)
+                }
+                Text(flight.gameDifficulty.rawValue.uppercased())
+                    .font(.caption.bold())
+                    .foregroundStyle(.cyan)
+            }
+
+            Text("Dominant hand (settings only — gestures no longer switch)")
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+
+            handednessRow(
+                title: "Ship",
+                selection: flight.shipDominantHand
+            ) { flight.setShipDominantHand($0) }
+            handednessRow(
+                title: "Walking",
+                selection: flight.walkingDominantHand
+            ) { flight.setWalkingDominantHand($0) }
+            handednessRow(
+                title: "Rover",
+                selection: flight.roverDominantHand
+            ) { flight.setRoverDominantHand($0) }
+
+            if let prompt = flight.settingsResetPrompt {
+                resetDifficultyChooser(prompt)
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Progress")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    Button {
+                        pendingDifficulty = flight.gameDifficulty
+                        flight.beginSettingsResetPrompt(.fullReset)
+                    } label: {
+                        Label(
+                            "Reset game data",
+                            systemImage: "arrow.counterclockwise.circle"
+                        )
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+
+                    Text(
+                        "Returns you to the starting station and clears"
+                            + " inventory & Mon (§)."
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                    Button {
+                        pendingDifficulty = flight.gameDifficulty
+                        flight.beginSettingsResetPrompt(.worldResetKeepStuff)
+                    } label: {
+                        Label(
+                            "Reset world (keep stuff) • TEST",
+                            systemImage: "wrench.and.screwdriver"
+                        )
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.orange)
+
+                    Text(
+                        "Testing only — relocate + change difficulty,"
+                            + " keep inventory. Removed at ship."
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.orange.opacity(0.85))
+                }
+            }
+
+            Button("Resume") {
+                flight.closeSettingsMenu()
+            }
+            .buttonStyle(.borderedProminent)
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    private func handednessRow(
+        title: String,
+        selection: DominantHandSetting,
+        onSelect: @escaping (DominantHandSetting) -> Void
+    ) -> some View {
+        HStack {
+            Text(title)
+                .font(.headline)
+                .frame(width: 90, alignment: .leading)
+            ForEach(DominantHandSetting.allCases, id: \.self) { hand in
+                Button {
+                    onSelect(hand)
+                } label: {
+                    Text(hand == .right ? "Right" : "Left")
+                        .font(.subheadline.bold())
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(
+                            selection == hand
+                                ? Color.cyan.opacity(0.35)
+                                : Color.white.opacity(0.08)
+                        )
+                        .clipShape(.rect(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func resetDifficultyChooser(
+        _ prompt: SettingsResetPrompt
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(
+                prompt == .fullReset
+                    ? "Reset game — choose difficulty"
+                    : "World reset (keep stuff) — choose difficulty"
+            )
+            .font(.headline)
+
+            ForEach(GameDifficulty.allCases, id: \.self) { difficulty in
+                Button {
+                    pendingDifficulty = difficulty
+                } label: {
+                    HStack(alignment: .top) {
+                        Image(
+                            systemName: pendingDifficulty == difficulty
+                                ? "checkmark.circle.fill"
+                                : "circle"
+                        )
+                        .foregroundStyle(
+                            pendingDifficulty == difficulty ? .cyan : .secondary
+                        )
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(difficulty.rawValue)
+                                .font(.headline)
+                            Text(difficulty.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(10)
+                    .background(.white.opacity(0.08))
+                    .clipShape(.rect(cornerRadius: 10))
+                }
+                .buttonStyle(.plain)
+            }
+
+            HStack {
+                Button("Cancel") {
+                    flight.cancelSettingsResetPrompt()
+                }
+                .buttonStyle(.bordered)
+                Spacer()
+                Button(
+                    prompt == .fullReset
+                        ? "Reset & start"
+                        : "Reset world"
+                ) {
+                    flight.confirmSettingsReset(
+                        difficulty: pendingDifficulty,
+                        keepInventoryAndCredits:
+                            prompt == .worldResetKeepStuff
+                    )
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(prompt == .fullReset ? .red : .orange)
+            }
+        }
+        .padding(12)
+        .background(.black.opacity(0.35))
+        .clipShape(.rect(cornerRadius: 12))
+    }
+
     private func inventoryButton(_ item: InventoryItem) -> some View {
         let iconName: String = switch item.category {
         case .log: "tree.fill"
         case .mineral: "diamond.fill"
         case .electronic: "cpu.fill"
         case .creatureMaterial: "pawprint.fill"
+        case .relic: "crown.fill"
+        case .relicKey: "key.fill"
+        case .element: "atom"
+        case .blueprint: "doc.text.fill"
+        case .module: "cpu"
         }
         let iconColor: Color = switch item.category {
         case .log: .green
         case .mineral: .cyan
         case .electronic: .orange
         case .creatureMaterial: .pink
+        case .relic: .yellow
+        case .relicKey: .purple
+        case .element: .mint
+        case .blueprint: .white
+        case .module: .blue
         }
         return Button {
             flight.equipInventoryItem(item)
@@ -344,6 +651,232 @@ private struct SurfaceInventoryView: View {
     }
 }
 
+private struct StationShopView: View {
+    @Environment(FlightModel.self) private var flight
+
+    var body: some View {
+        if flight.isStationShopPresented {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Label("STATION SHOP", systemImage: "cart.fill")
+                        .font(.title3.bold())
+                    Spacer()
+                    Text(ProgressionEconomy.formatMon(flight.mon))
+                        .font(.headline.monospacedDigit())
+                        .foregroundStyle(.yellow)
+                    Button("CLOSE") { flight.closeStationShop() }
+                        .buttonStyle(.bordered)
+                }
+                ForEach(ProgressionEconomy.ShopSKU.allCases) { sku in
+                    Button {
+                        flight.purchaseShopSKU(sku)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack {
+                                Text(sku.title).font(.headline)
+                                Spacer()
+                                Text(ProgressionEconomy.formatMon(sku.priceMon))
+                                    .foregroundStyle(.yellow)
+                            }
+                            Text(sku.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .background(.white.opacity(0.08))
+                        .clipShape(.rect(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(20)
+            .frame(width: 720)
+            .background(.black.opacity(0.78))
+            .glassBackgroundEffect()
+        }
+    }
+}
+
+private struct RefineryFabricatorView: View {
+    @Environment(FlightModel.self) private var flight
+
+    /// Fits between top HUD and lower cockpit / leave-ship controls.
+    private let panelWidth: CGFloat = 560
+    private let panelMaxHeight: CGFloat = 360
+    private let dismissPlaneWidth: CGFloat = 1_100
+    private let dismissPlaneHeight: CGFloat = 640
+
+    var body: some View {
+        if flight.isRefineryPresented {
+            ZStack {
+                Button {
+                    flight.closeRefineryPanel()
+                } label: {
+                    Color.black.opacity(0.22)
+                        .frame(
+                            width: dismissPlaneWidth,
+                            height: dismissPlaneHeight
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close refinery")
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 10) {
+                        Label(
+                            "REFINERY / FABRICATOR",
+                            systemImage: "hammer.fill"
+                        )
+                        .font(.headline.bold())
+                        Spacer(minLength: 8)
+                        Text(
+                            "E \(Int(flight.organicEnergy))"
+                                + "/\(Int(flight.organicEnergyCapacity))"
+                        )
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.green)
+                        Button("CLOSE") { flight.closeRefineryPanel() }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.secondary)
+                            .controlSize(.small)
+                    }
+
+                    Button("CONVERT LOGS → ENERGY") {
+                        _ = flight.convertLogsToEnergy()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                    .disabled(!flight.canConvertLogsToEnergy)
+                    .opacity(flight.canConvertLogsToEnergy ? 1 : 0.45)
+
+                    Text("Craft")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            ForEach(ProgressionEconomy.craftRecipes) { recipe in
+                                craftRecipeRow(recipe)
+                            }
+                        }
+                        .padding(.trailing, 4)
+                    }
+                    .scrollIndicators(.visible)
+
+                    Text(
+                        "Equip an inventory item, then REFINE 1 from the kit."
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
+                .padding(16)
+                .frame(
+                    width: panelWidth,
+                    height: panelMaxHeight,
+                    alignment: .top
+                )
+                .background(.black.opacity(0.82))
+                .glassBackgroundEffect()
+                .clipShape(.rect(cornerRadius: 16))
+            }
+            .frame(
+                width: dismissPlaneWidth,
+                height: dismissPlaneHeight
+            )
+            .allowsHitTesting(true)
+        }
+    }
+
+    @ViewBuilder
+    private func craftRecipeRow(
+        _ recipe: ProgressionEconomy.CraftRecipe
+    ) -> some View {
+        let craftable = flight.canCraftRecipe(recipe)
+        let ingredients = flight.recipeIngredientStatuses(recipe)
+        Button {
+            _ = flight.craftRecipe(recipe.id)
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(recipe.title)
+                    .font(
+                        craftable
+                            ? .subheadline.bold()
+                            : .subheadline
+                    )
+                    .foregroundStyle(
+                        craftable
+                            ? Color.primary
+                            : Color.secondary.opacity(0.55)
+                    )
+                recipeIngredientsLine(ingredients)
+                if let note = craftRecipeNote(recipe) {
+                    Text(note)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary.opacity(0.7))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(8)
+            .background(
+                craftable
+                    ? Color.white.opacity(0.12)
+                    : Color.white.opacity(0.04)
+            )
+            .clipShape(.rect(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .disabled(!craftable)
+    }
+
+    private func recipeIngredientsLine(
+        _ ingredients: [(id: String, label: String, satisfied: Bool)]
+    ) -> Text {
+        var combined = Text("")
+        for (index, ingredient) in ingredients.enumerated() {
+            if index > 0 {
+                combined = combined
+                    + Text(" • ")
+                    .font(.caption2)
+                    .foregroundColor(Color.secondary.opacity(0.45))
+            }
+            combined = combined
+                + Text(ingredient.label)
+                .font(
+                    ingredient.satisfied
+                        ? .caption2.bold()
+                        : .caption2
+                )
+                .foregroundColor(
+                    ingredient.satisfied
+                        ? Color.primary
+                        : Color.secondary.opacity(0.5)
+                )
+        }
+        return combined
+    }
+
+    private func craftRecipeNote(
+        _ recipe: ProgressionEconomy.CraftRecipe
+    ) -> String? {
+        var notes: [String] = []
+        if let recharge = recipe.energyCubeRecharge {
+            notes.append("single-use +\(Int(recharge)) energy")
+        }
+        if let bonus = recipe.energyCapacityBonus {
+            notes.append("permanent +\(Int(bonus)) capacity")
+        }
+        if recipe.blueprintID != nil {
+            notes.append("needs blueprint")
+        }
+        if let required = recipe.requiredStorageExpansions, required > 0 {
+            notes.append("requires prior storage \(required)")
+        }
+        return notes.isEmpty ? nil : notes.joined(separator: " • ")
+    }
+}
+
 private struct ShipTargetContactHUD: View {
     @Environment(FlightModel.self) private var flight
 
@@ -366,10 +899,15 @@ private struct CockpitHUD: View {
                         String(format: "%.0f m/s", flight.travelSpeed),
                         systemImage: "speedometer"
                     )
-                    Text("SECTOR \(flight.currentRegion)")
+                    Text("FUEL \(Int(flight.shipFuel))")
                         .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                    Text("VISITED \(flight.visitedSectorCount)")
+                        .foregroundStyle(
+                            flight.shipFuel < 20 ? .red : .orange
+                        )
+                    Text(ProgressionEconomy.formatMon(flight.mon))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.yellow)
+                    Text("SECTOR \(flight.currentRegion)")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
@@ -792,6 +1330,21 @@ private struct SurfaceVitalsStrip: View {
                 value: flight.playerHealth,
                 maximum: 20
             )
+            compactMeter(
+                "ENERGY",
+                value: flight.organicEnergy,
+                maximum: flight.organicEnergyCapacity,
+                tint: .green
+            )
+            if flight.activeExplorationMode == "Leave on foot",
+               flight.displayedJetpackFuel < FlightModel.jetpackFuelCapacity - 0.05 {
+                compactMeter(
+                    "ROCKET",
+                    value: flight.displayedJetpackFuel,
+                    maximum: FlightModel.jetpackFuelCapacity,
+                    tint: .yellow
+                )
+            }
             if flight.activeExplorationMode == "Deploy rover" {
                 compactMeter(
                     "SHIELD",
@@ -902,117 +1455,264 @@ private struct DamageAndGameOverOverlay: View {
     }
 }
 
+/// Expansion direction for panel-attached menus.
+/// - `bottomBarRaises`: options appear above the trigger (lower cockpit bar).
+/// - `topBarDrops`: options appear below the trigger (inventory / top bars).
+private enum PanelMenuExpansion {
+    case bottomBarRaises
+    case topBarDrops
+}
+
+private extension View {
+    func panelMenuExpansion(_ expansion: PanelMenuExpansion) -> some View {
+        // Marker for layout audits — keeps top/bottom menu direction explicit.
+        accessibilityHint(
+            expansion == .bottomBarRaises
+                ? "Menu expands upward from the bottom bar"
+                : "Menu expands downward from the top bar"
+        )
+    }
+}
+
 private struct CockpitControlPanel: View {
     @Environment(FlightModel.self) private var flight
     @Binding var isDetectionPickerPresented: Bool
+    @State private var isLeaveMenuPresented = false
 
     var body: some View {
         Group {
             if shouldShowPanel {
                 VStack(spacing: 8) {
-                    if flight.isOutsideShip {
-                        HStack(spacing: 12) {
-                            Label(
-                                flight.activeExplorationMode ?? "Outside ship",
-                                systemImage: "figure.walk"
+                    // Bottom-bar menus raise upward above the button row.
+                    if !flight.isOutsideShip {
+                        if isDetectionPickerPresented {
+                            DetectionPicker(
+                                isPresented: $isDetectionPickerPresented
                             )
-                            .font(.headline)
-                            if flight.activeExplorationMode == "Deploy rover" {
-                                Button(
-                                    "LEAVE ROVER",
-                                    systemImage: "figure.walk"
-                                ) {
-                                    flight.leaveRover()
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .tint(.orange)
-                            }
-                            if !flight.isSurfaceExploration
-                                || flight.canEnterShip {
-                                Button(
-                                    "ENTER SHIP",
-                                    systemImage: "airplane"
-                                ) {
-                                    flight.returnToShip()
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .tint(.cyan)
-                            }
-                            if flight.canEnterRover {
-                                Button(
-                                    "ENTER ROVER",
-                                    systemImage: "car.side.fill"
-                                ) {
-                                    flight.enterRover()
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .tint(.orange)
-                            }
-                        }
-                    } else {
-                        HStack(spacing: 10) {
-                            Button(flight.landingControlTitle, systemImage: "arrow.up.and.down.circle.fill") {
-                                flight.performLandingControl()
-                            }
-                            .disabled(!flight.canUseLandingControl)
-                            .tint(flight.canUseLandingControl ? .cyan : .gray.opacity(0.35))
-
-                            Button(flight.currentWeapon, systemImage: "scope") {
-                                flight.cycleWeapon()
-                            }
-                            .disabled(!flight.canCycleWeapons)
-                            .tint(flight.canCycleWeapons ? .red : .gray.opacity(0.35))
-
-                            Button(
-                                flight.isShipShieldActive
-                                    ? "SHIELD ON"
-                                    : "SHIELD OFF",
-                                systemImage:
-                                    flight.isShipShieldActive
-                                        ? "shield.fill"
-                                        : "shield.slash"
-                            ) {
-                                flight.toggleShipShield()
-                            }
-                            .tint(
-                                flight.isShipShieldActive ? .blue : .gray
+                            .environment(flight)
+                            .transition(
+                                .move(edge: .bottom).combined(with: .opacity)
                             )
-
-                            Button {
-                                isDetectionPickerPresented = true
-                            } label: {
-                                Label("DETECT ∞", systemImage: "sensor.tag.radiowaves.forward.fill")
-                            }
-                            .disabled(!flight.canUseDetection)
-                            .tint(flight.canUseDetection ? .green : .gray.opacity(0.35))
-
-                            Menu {
-                                ForEach(flight.availableExitOptions, id: \.self) { option in
-                                    Button(option) {
-                                        flight.selectExitOption(option)
-                                    }
-                                }
-                            } label: {
-                                Label("LEAVE", systemImage: "figure.walk")
-                            }
-                            .disabled(!flight.canLeaveShip)
-                            .tint(flight.canLeaveShip ? .orange : .gray.opacity(0.35))
                         }
-                        .buttonStyle(.borderedProminent)
+                        if isLeaveMenuPresented {
+                            leaveOptionsMenu
+                                .transition(
+                                    .move(edge: .bottom)
+                                        .combined(with: .opacity)
+                                )
+                        }
                     }
 
-                    if !flight.interactionStatus.isEmpty {
-                        Text(flight.interactionStatus)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.cyan)
-                            .lineLimit(1)
+                    VStack(spacing: 8) {
+                        if flight.isOutsideShip {
+                            outsideShipControls
+                        } else {
+                            inShipControls
+                        }
+
+                        if !flight.interactionStatus.isEmpty {
+                            Text(flight.interactionStatus)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.cyan)
+                                .lineLimit(1)
+                        }
                     }
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 12)
+                    .glassBackgroundEffect()
                 }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 12)
-                .glassBackgroundEffect()
+                .frame(maxWidth: 980, alignment: .bottom)
+                // Fixed-height, bottom-aligned so raised menus grow upward
+                // without shifting the button row down in the attachment.
+                .frame(height: 430, alignment: .bottom)
+                .panelMenuExpansion(.bottomBarRaises)
+                .animation(
+                    .snappy(duration: 0.18),
+                    value: isLeaveMenuPresented
+                )
+                .animation(
+                    .snappy(duration: 0.18),
+                    value: isDetectionPickerPresented
+                )
             }
         }
+        .onChange(of: flight.isOutsideShip) { _, outside in
+            if outside {
+                isLeaveMenuPresented = false
+                isDetectionPickerPresented = false
+            }
+        }
+        .onChange(of: flight.canLeaveShip) { _, canLeave in
+            if !canLeave { isLeaveMenuPresented = false }
+        }
+        .onChange(of: flight.isRefineryPresented) { _, presented in
+            if presented {
+                isLeaveMenuPresented = false
+                isDetectionPickerPresented = false
+            }
+        }
+        .onChange(of: flight.isStationShopPresented) { _, presented in
+            if presented {
+                isLeaveMenuPresented = false
+                isDetectionPickerPresented = false
+            }
+        }
+    }
+
+    private var outsideShipControls: some View {
+        HStack(spacing: 12) {
+            Label(
+                flight.activeExplorationMode ?? "Outside ship",
+                systemImage: "figure.walk"
+            )
+            .font(.headline)
+            if flight.activeExplorationMode == "Deploy rover" {
+                Button(
+                    "LEAVE ROVER",
+                    systemImage: "figure.walk"
+                ) {
+                    flight.leaveRover()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+            }
+            if !flight.isSurfaceExploration || flight.canEnterShip {
+                Button(
+                    "ENTER SHIP",
+                    systemImage: "airplane"
+                ) {
+                    flight.returnToShip()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.cyan)
+            }
+            if flight.canEnterRover {
+                Button(
+                    "ENTER ROVER",
+                    systemImage: "car.side.fill"
+                ) {
+                    flight.enterRover()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+            }
+            if flight.isFabricatorAvailable {
+                Button(
+                    "REFINERY",
+                    systemImage: "hammer.fill"
+                ) {
+                    flight.openRefineryPanel()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.mint)
+            }
+        }
+    }
+
+    private var inShipControls: some View {
+        HStack(spacing: 10) {
+            Button(
+                flight.landingControlTitle,
+                systemImage: "arrow.up.and.down.circle.fill"
+            ) {
+                closeBottomMenus()
+                flight.performLandingControl()
+            }
+            .disabled(!flight.canUseLandingControl)
+            .tint(
+                flight.canUseLandingControl
+                    ? .cyan : .gray.opacity(0.35)
+            )
+
+            Button(flight.currentWeapon, systemImage: "scope") {
+                closeBottomMenus()
+                flight.cycleWeapon()
+            }
+            .disabled(!flight.canCycleWeapons)
+            .tint(
+                flight.canCycleWeapons ? .red : .gray.opacity(0.35)
+            )
+
+            Button(
+                flight.isShipShieldActive ? "SHIELD ON" : "SHIELD OFF",
+                systemImage: flight.isShipShieldActive
+                    ? "shield.fill" : "shield.slash"
+            ) {
+                closeBottomMenus()
+                flight.toggleShipShield()
+            }
+            .tint(flight.isShipShieldActive ? .blue : .gray)
+
+            Button {
+                isLeaveMenuPresented = false
+                isDetectionPickerPresented.toggle()
+            } label: {
+                Label(
+                    flight.hasNavModule
+                        ? "DETECT ∞"
+                        : "DETECT LOCKED",
+                    systemImage:
+                        "sensor.tag.radiowaves.forward.fill"
+                )
+            }
+            .disabled(!flight.canPresentDetectionPicker)
+            .tint(
+                flight.canUseDetection
+                    ? .green
+                    : .gray.opacity(0.35)
+            )
+
+            if flight.isFabricatorAvailable {
+                Button("REFINERY", systemImage: "hammer.fill") {
+                    closeBottomMenus()
+                    flight.openRefineryPanel()
+                }
+                .tint(.mint)
+            }
+
+            Button {
+                isDetectionPickerPresented = false
+                isLeaveMenuPresented.toggle()
+            } label: {
+                Label("LEAVE", systemImage: "figure.walk")
+            }
+            .disabled(!flight.canLeaveShip)
+            .tint(
+                flight.canLeaveShip
+                    ? .orange : .gray.opacity(0.35)
+            )
+        }
+        .buttonStyle(.borderedProminent)
+    }
+
+    private var leaveOptionsMenu: some View {
+        HStack {
+            Spacer(minLength: 0)
+            VStack(alignment: .trailing, spacing: 6) {
+                ForEach(
+                    flight.availableExitOptions,
+                    id: \.self
+                ) { option in
+                    Button(option) {
+                        flight.selectExitOption(option)
+                        isLeaveMenuPresented = false
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                    .controlSize(.large)
+                }
+            }
+            .padding(10)
+            .background(.black.opacity(0.55))
+            .glassBackgroundEffect()
+            .clipShape(.rect(cornerRadius: 14))
+        }
+        .panelMenuExpansion(.bottomBarRaises)
+    }
+
+    private func closeBottomMenus() {
+        isLeaveMenuPresented = false
+        isDetectionPickerPresented = false
     }
 
     private var shouldShowPanel: Bool {
@@ -1030,68 +1730,84 @@ private struct DetectionPicker: View {
 
     var body: some View {
         if isPresented && !flight.isOutsideShip {
-            VStack(spacing: 14) {
+            VStack(spacing: 12) {
                 Label(
                     "FIND NEAREST",
                     systemImage: "sensor.tag.radiowaves.forward.fill"
                 )
                 .font(.title3.bold())
 
-                HStack(spacing: 12) {
-                    detectionButton(
-                        "PLANET",
-                        systemImage: "globe.americas.fill",
-                        kind: .world
-                    )
-                    Button(
-                        "AIRLESS PLANET",
-                        systemImage: "moon.stars.fill"
-                    ) {
-                        flight.detectNearestAirlessPlanet()
-                        isPresented = false
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.indigo)
-                    .controlSize(.large)
-                }
-
-                HStack(spacing: 12) {
-                    detectionButton(
-                        "STATION",
-                        systemImage: "building.2.fill",
-                        kind: .station
-                    )
-                    detectionButton(
-                        "WRECKAGE",
-                        systemImage: "exclamationmark.triangle.fill",
-                        kind: .wreckage
-                    )
-                }
-
-                HStack(spacing: 12) {
-                    Button(
-                        "CANCEL CURRENT TARGET",
-                        systemImage: "scope"
-                    ) {
-                        flight.cancelAutopilotTarget()
-                        isPresented = false
-                    }
-                    .disabled(!flight.hasAutopilotTarget)
-                    .tint(
-                        flight.hasAutopilotTarget
-                            ? .red
-                            : .gray.opacity(0.35)
-                    )
-
+                if !flight.hasNavModule {
+                    Text(flight.detectionLockReason)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .multilineTextAlignment(.center)
                     Button("CLOSE", systemImage: "xmark.circle.fill") {
                         isPresented = false
                     }
+                    .buttonStyle(.borderedProminent)
                     .tint(.secondary)
+                } else {
+                    HStack(spacing: 12) {
+                        detectionButton(
+                            "PLANET",
+                            systemImage: "globe.americas.fill",
+                            kind: .world
+                        )
+                        Button(
+                            "AIRLESS PLANET",
+                            systemImage: "moon.stars.fill"
+                        ) {
+                            flight.detectNearestAirlessPlanet()
+                            isPresented = false
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.indigo)
+                        .controlSize(.large)
+                    }
+
+                    HStack(spacing: 12) {
+                        detectionButton(
+                            "STATION",
+                            systemImage: "building.2.fill",
+                            kind: .station
+                        )
+                        detectionButton(
+                            "WRECKAGE",
+                            systemImage: "exclamationmark.triangle.fill",
+                            kind: .wreckage
+                        )
+                    }
+
+                    HStack(spacing: 12) {
+                        Button(
+                            "CANCEL CURRENT TARGET",
+                            systemImage: "scope"
+                        ) {
+                            flight.cancelAutopilotTarget()
+                            isPresented = false
+                        }
+                        .disabled(!flight.hasAutopilotTarget)
+                        .tint(
+                            flight.hasAutopilotTarget
+                                ? .red
+                                : .gray.opacity(0.35)
+                        )
+
+                        Button("CLOSE", systemImage: "xmark.circle.fill") {
+                            isPresented = false
+                        }
+                        .tint(.secondary)
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.borderedProminent)
             }
-            .padding(22)
+            .padding(16)
+            .frame(maxWidth: .infinity)
+            .background(.black.opacity(0.55))
             .glassBackgroundEffect()
+            .clipShape(.rect(cornerRadius: 14))
+            .panelMenuExpansion(.bottomBarRaises)
         }
     }
 
@@ -1113,43 +1829,256 @@ private struct DetectionPicker: View {
 @MainActor
 private final class ControllerObserver {
     private weak var flight: FlightModel?
+    private var connectObserver: NSObjectProtocol?
+    private var disconnectObserver: NSObjectProtocol?
+    private var leftStickX: Float = 0
+    private var leftStickY: Float = 0
+    private var leftShoulderHeld = false
+    private var leftStickClicked = false
+    private var rightTriggerValue: Float = 0
+    private var rightTriggerWasPressed = false
+    private var lastToolUpdateTime = ProcessInfo.processInfo.systemUptime
+    private var toolPulseTask: Task<Void, Never>?
 
     func connect(to flight: FlightModel) {
         self.flight = flight
         GCController.controllers().forEach(configure)
+        connectObserver = NotificationCenter.default.addObserver(
+            forName: .GCControllerDidConnect,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                GCController.controllers().forEach {
+                    self?.configure($0)
+                }
+            }
+        }
+        disconnectObserver = NotificationCenter.default.addObserver(
+            forName: .GCControllerDidDisconnect,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.clearSurfaceLocomotion()
+            }
+        }
+        startToolPulse()
     }
 
     func disconnect() {
+        toolPulseTask?.cancel()
+        toolPulseTask = nil
+        if let connectObserver {
+            NotificationCenter.default.removeObserver(connectObserver)
+        }
+        if let disconnectObserver {
+            NotificationCenter.default.removeObserver(disconnectObserver)
+        }
+        connectObserver = nil
+        disconnectObserver = nil
+        clearSurfaceLocomotion()
         flight?.pitchInput = 0
         flight?.yawInput = 0
         flight?.rollInput = 0
+        flight?.throttle = 0
         flight = nil
+    }
+
+    private func startToolPulse() {
+        toolPulseTask?.cancel()
+        toolPulseTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 16_000_000)
+                await MainActor.run {
+                    self?.pulseControllerTool()
+                }
+            }
+        }
+    }
+
+    private func pulseControllerTool() {
+        guard let flight,
+              !flight.isPaused,
+              flight.activeExplorationMode == "Leave on foot" else {
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = Float(min(0.05, max(0, now - lastToolUpdateTime)))
+        lastToolUpdateTime = now
+        let pressed = rightTriggerValue > 0.35
+        flight.updateControllerSurfaceTool(
+            pressed: pressed,
+            wasPressed: rightTriggerWasPressed,
+            deltaTime: dt
+        )
+        rightTriggerWasPressed = pressed
+    }
+
+    private func clearSurfaceLocomotion() {
+        guard let flight else { return }
+        if flight.activeExplorationMode == "Leave on foot" {
+            flight.setExplorationControls(forward: 0, turn: 0)
+            flight.setControllerRunHeld(false)
+            flight.setJetpackThrusting(false)
+            flight.stopMatterCrumblerBeam()
+        } else if flight.activeExplorationMode == "Deploy rover" {
+            flight.setExplorationControls(forward: 0, turn: 0)
+        }
     }
 
     private func configure(_ controller: GCController) {
         guard let gamepad = controller.extendedGamepad else { return }
+
         gamepad.leftThumbstick.valueChangedHandler = { [weak self] _, x, y in
             Task { @MainActor in
-                self?.flight?.yawInput = Double(-x)
-                self?.flight?.pitchInput = Double(y)
+                guard let self else { return }
+                self.leftStickX = x
+                self.leftStickY = y
+                self.applyLeftStick()
+            }
+        }
+        gamepad.leftThumbstickButton?.pressedChangedHandler = {
+            [weak self] _, _, pressed in
+            Task { @MainActor in
+                self?.leftStickClicked = pressed
+                self?.applyLeftStick()
             }
         }
         gamepad.rightThumbstick.xAxis.valueChangedHandler = { [weak self] _, value in
-            Task { @MainActor in self?.flight?.rollInput = Double(value) }
-        }
-        gamepad.rightTrigger.valueChangedHandler = { [weak self] _, value, _ in
-            Task { @MainActor in self?.flight?.throttle = Double(value) }
-        }
-        gamepad.buttonA.pressedChangedHandler = { [weak self] _, _, pressed in
-            guard pressed else { return }
             Task { @MainActor in
                 guard let self, let flight = self.flight else { return }
+                if flight.isPaused || flight.isSurfaceExploration {
+                    return
+                }
+                flight.rollInput = Double(value)
+            }
+        }
+        gamepad.rightTrigger.valueChangedHandler = { [weak self] _, value, _ in
+            Task { @MainActor in
+                guard let self, let flight = self.flight else { return }
+                self.rightTriggerValue = value
+                if flight.isPaused
+                    || flight.activeExplorationMode == "Leave on foot"
+                    || flight.activeExplorationMode == "Deploy rover" {
+                    return
+                }
+                flight.throttle = Double(value)
+            }
+        }
+        gamepad.leftTrigger.valueChangedHandler = { [weak self] _, value, _ in
+            Task { @MainActor in
+                guard let flight = self?.flight,
+                      !flight.isPaused,
+                      !flight.isSurfaceExploration else { return }
+                if value > 0.08 {
+                    flight.throttle = Double(-value * 0.5)
+                }
+            }
+        }
+        gamepad.buttonA.pressedChangedHandler = { [weak self] _, _, pressed in
+            Task { @MainActor in
+                guard let self, let flight = self.flight else { return }
+                if flight.isPaused { return }
+                if flight.activeExplorationMode == "Leave on foot" {
+                    flight.setJetpackThrusting(pressed)
+                    return
+                }
+                guard pressed else { return }
+                if flight.activeExplorationMode == "Deploy rover" {
+                    flight.leaveRover()
+                    return
+                }
                 flight.autopilot.toggle()
             }
         }
         gamepad.buttonB.pressedChangedHandler = { [weak self] _, _, pressed in
             guard pressed else { return }
-            Task { @MainActor in self?.flight?.stop() }
+            Task { @MainActor in
+                guard let flight = self?.flight, !flight.isPaused else { return }
+                if flight.isSurfaceExploration {
+                    flight.boardNearestSurfaceVehicle()
+                    return
+                }
+                flight.stop()
+            }
         }
+        gamepad.buttonX.pressedChangedHandler = { [weak self] _, _, pressed in
+            guard pressed else { return }
+            Task { @MainActor in
+                guard let flight = self?.flight,
+                      !flight.isPaused,
+                      flight.activeExplorationMode == "Leave on foot" else {
+                    return
+                }
+                flight.collectWithControllerGaze()
+            }
+        }
+        gamepad.buttonY.pressedChangedHandler = { [weak self] _, _, pressed in
+            guard pressed else { return }
+            Task { @MainActor in
+                guard let flight = self?.flight else { return }
+                if flight.isSurfaceExploration || flight.canPresentInventory {
+                    flight.toggleSurfaceKit()
+                }
+            }
+        }
+        gamepad.leftShoulder.pressedChangedHandler = { [weak self] _, _, pressed in
+            Task { @MainActor in
+                guard let self else { return }
+                self.leftShoulderHeld = pressed
+                self.applyLeftStick()
+                guard pressed,
+                      let flight = self.flight,
+                      !flight.isPaused,
+                      flight.activeExplorationMode == "Leave on foot" else {
+                    return
+                }
+                flight.cycleSurfaceTool(by: -1)
+            }
+        }
+        gamepad.rightShoulder.pressedChangedHandler = { [weak self] _, _, pressed in
+            guard pressed else { return }
+            Task { @MainActor in
+                guard let flight = self?.flight,
+                      !flight.isPaused,
+                      flight.activeExplorationMode == "Leave on foot" else {
+                    return
+                }
+                flight.cycleSurfaceTool(by: 1)
+            }
+        }
+        gamepad.dpad.up.pressedChangedHandler = { [weak self] _, _, pressed in
+            guard pressed else { return }
+            Task { @MainActor in
+                guard let flight = self?.flight else { return }
+                if flight.isSurfaceExploration || flight.canPresentInventory {
+                    flight.toggleSurfaceKit()
+                }
+            }
+        }
+    }
+
+    private func applyLeftStick() {
+        guard let flight, !flight.isPaused else { return }
+        if flight.activeExplorationMode == "Leave on foot" {
+            let forward = Double(max(0, leftStickY))
+            flight.setExplorationControls(forward: forward, turn: 0)
+            let moving = leftStickY > 0.15
+            let run =
+                moving
+                    && (leftStickClicked || leftShoulderHeld)
+            flight.setControllerRunHeld(run)
+            return
+        }
+        if flight.activeExplorationMode == "Deploy rover" {
+            flight.setExplorationControls(
+                forward: Double(leftStickY),
+                turn: Double(leftStickX)
+            )
+            return
+        }
+        flight.yawInput = Double(-leftStickX)
+        flight.pitchInput = Double(leftStickY)
     }
 }

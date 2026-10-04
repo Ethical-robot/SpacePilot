@@ -79,19 +79,42 @@ struct MissionControlView: View {
 
     private var telemetry: some View {
         HStack(spacing: 12) {
-            MetricCard(label: "SPEED", value: String(format: "%.1f", flight.travelSpeed), unit: "m/s")
+            MetricCard(label: "SPEED", value: String(format: "%.1f", flight.displayedTravelSpeed), unit: "m/s")
             MetricCard(label: "NEAREST", value: flight.nearestObject, unit: String(format: "%.0f m", flight.nearestDistance))
-            MetricCard(label: "DISTANCE", value: String(format: "%.0f", flight.distanceTravelled), unit: "m")
+            MetricCard(label: "DISTANCE", value: String(format: "%.0f", flight.displayedDistanceTravelled), unit: "m")
             MetricCard(label: "MISSION", value: formattedTime, unit: "")
         }
     }
 
     private var flightControls: some View {
-        @Bindable var flight = flight
         return VStack(spacing: 18) {
-            ControlSlider(title: "THRUST", icon: "flame.fill", value: $flight.throttle, range: -0.5...1)
-            ControlSlider(title: "PITCH", icon: "arrow.up.and.down", value: $flight.pitchInput, range: -1...1)
-            ControlSlider(title: "YAW", icon: "arrow.left.and.right", value: $flight.yawInput, range: -1...1)
+            ControlSlider(
+                title: "THRUST",
+                icon: "flame.fill",
+                value: Binding(
+                    get: { flight.throttle },
+                    set: { flight.throttle = $0 }
+                ),
+                range: -0.5...1
+            )
+            ControlSlider(
+                title: "PITCH",
+                icon: "arrow.up.and.down",
+                value: Binding(
+                    get: { flight.pitchInput },
+                    set: { flight.pitchInput = $0 }
+                ),
+                range: -1...1
+            )
+            ControlSlider(
+                title: "YAW",
+                icon: "arrow.left.and.right",
+                value: Binding(
+                    get: { flight.yawInput },
+                    set: { flight.yawInput = $0 }
+                ),
+                range: -1...1
+            )
 
             HStack {
                 Label("HAND FLIGHT", systemImage: "hand.raised.fill")
@@ -102,7 +125,7 @@ struct MissionControlView: View {
                     .foregroundStyle(flight.dominantHandActive ? .green : .secondary)
             }
 
-            Toggle(isOn: $flight.autopilot) {
+            Toggle(isOn: Bindable(flight).autopilot) {
                 Label("Navigation computer", systemImage: "scope")
             }
             .toggleStyle(.switch)
@@ -140,7 +163,7 @@ struct MissionControlView: View {
     }
 
     private var formattedTime: String {
-        let total = Int(flight.elapsedTime)
+        let total = Int(flight.displayedElapsedTime)
         return String(format: "%02d:%02d", total / 60, total % 60)
     }
 }

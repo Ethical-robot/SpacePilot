@@ -3,6 +3,11 @@ import simd
 import UIKit
 
 enum SpaceSceneBuilder {
+    /// Shared post-pass group so aiming + directional cues draw above world
+    /// geometry in a stable order relative to each other.
+    @MainActor
+    static let hudOverlaySortGroup = ModelSortGroup(depthPass: .postPass)
+
     @MainActor
     static func makeScene() -> Entity {
         let root = Entity()
@@ -73,6 +78,7 @@ enum SpaceSceneBuilder {
 
         let colors: [UIColor] = [
             .systemGray,
+            .systemBrown,
             .systemCyan,
             .systemOrange,
             .systemRed,
@@ -96,17 +102,19 @@ enum SpaceSceneBuilder {
                 ]
             )
             slot.addChild(plate)
+            let isEmpty = tool == .empty
+            let isAxe = tool == .axe
             let glyph = ModelEntity(
                 mesh: .generateBox(
-                    width: index == 0 ? 0.025 : 0.009,
-                    height: index == 1 ? 0.034 : 0.026,
-                    depth: index == 0 ? 0.002 : 0.008
+                    width: isEmpty ? 0.025 : (isAxe ? 0.012 : 0.009),
+                    height: isAxe ? 0.034 : (isEmpty ? 0.002 : 0.026),
+                    depth: isEmpty ? 0.002 : 0.008
                 ),
                 materials: [UnlitMaterial(color: .white)]
             )
             glyph.position.z = 0.009
             glyph.orientation = simd_quatf(
-                angle: index == 1 ? -0.55 : 0,
+                angle: isAxe ? -0.55 : 0,
                 axis: [0, 0, 1]
             )
             slot.addChild(glyph)
@@ -124,6 +132,35 @@ enum SpaceSceneBuilder {
         let empty = Entity()
         empty.name = SurfaceTool.empty.rawValue
         root.addChild(empty)
+
+        let axe = Entity()
+        axe.name = SurfaceTool.axe.rawValue
+        let axeHandle = ModelEntity(
+            mesh: .generateCylinder(height: 0.28, radius: 0.014),
+            materials: [
+                SimpleMaterial(
+                    color: UIColor(red: 0.45, green: 0.28, blue: 0.12, alpha: 1),
+                    roughness: 0.7,
+                    isMetallic: false
+                )
+            ]
+        )
+        axeHandle.orientation = simd_quatf(angle: .pi / 2, axis: [1, 0, 0])
+        axeHandle.position.z = -0.11
+        axe.addChild(axeHandle)
+        let axeHead = ModelEntity(
+            mesh: .generateBox(width: 0.14, height: 0.08, depth: 0.03),
+            materials: [
+                SimpleMaterial(
+                    color: UIColor(white: 0.55, alpha: 1),
+                    roughness: 0.35,
+                    isMetallic: true
+                )
+            ]
+        )
+        axeHead.position = [0.04, 0.02, -0.24]
+        axe.addChild(axeHead)
+        root.addChild(axe)
 
         let slicer = Entity()
         slicer.name = SurfaceTool.sonicSlicer.rawValue
@@ -438,7 +475,7 @@ enum SpaceSceneBuilder {
         )
         material.readsDepth = false
         material.writesDepth = true
-        let sortGroup = ModelSortGroup(depthPass: .postPass)
+        let sortGroup = hudOverlaySortGroup
 
         if let ringMesh = try? MeshResource.generate(from: [descriptor]) {
             let ring = ModelEntity(mesh: ringMesh, materials: [material])
@@ -554,12 +591,14 @@ enum SpaceSceneBuilder {
         // this fixed ship-forward distance.
         reference.position = [0, 0, -1.55]
 
+        // Match the aiming reticle depth policy so planets/atmosphere/HUD
+        // backdrop cannot bury the ship/rover nose cue.
         var material = UnlitMaterial(
-            color: UIColor.systemCyan.withAlphaComponent(0.38)
+            color: UIColor.systemCyan.withAlphaComponent(0.82)
         )
         material.readsDepth = false
-        material.writesDepth = false
-        let sortGroup = ModelSortGroup(depthPass: .postPass)
+        material.writesDepth = true
+        let sortGroup = hudOverlaySortGroup
 
         let segmentLength: Float = 0.044
         let segmentThickness: Float = 0.0045
@@ -601,7 +640,7 @@ enum SpaceSceneBuilder {
             model.components.set(
                 ModelSortGroupComponent(
                     group: sortGroup,
-                    order: 9_900 + Int32(index)
+                    order: 9_950 + Int32(index)
                 )
             )
             reference.addChild(model)
@@ -613,7 +652,7 @@ enum SpaceSceneBuilder {
         )
         center.name = "True Forward Center"
         center.components.set(
-            ModelSortGroupComponent(group: sortGroup, order: 9_904)
+            ModelSortGroupComponent(group: sortGroup, order: 9_954)
         )
         reference.addChild(center)
         return reference
