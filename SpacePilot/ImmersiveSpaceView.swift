@@ -102,6 +102,7 @@ struct ImmersiveSpaceView: View {
                 viewAnchor.addChild(countdown)
             }
             if let controls = attachments.entity(for: "cockpitControls") {
+                // Outside-ship enter/rover row stays head-relative.
                 controls.position = SIMD3<Float>(0, -0.36, -0.92)
                 controls.orientation = simd_quatf(angle: -0.12, axis: [1, 0, 0])
                 controls.components.set(
@@ -112,6 +113,7 @@ struct ImmersiveSpaceView: View {
                 )
                 viewAnchor.addChild(controls)
             }
+            syncConsoleFacetUI(attachments, cockpit: cockpit)
             if let contacts = attachments.entity(
                 for: "targetContactPanel"
             ) {
@@ -163,6 +165,9 @@ struct ImmersiveSpaceView: View {
                 )
                 viewAnchor.addChild(refinery)
             }
+        } update: { _, attachments in
+            guard let cockpit = flight.cockpitEntity else { return }
+            syncConsoleFacetUI(attachments, cockpit: cockpit)
         } attachments: {
             Attachment(id: "cockpitHUD") {
                 CockpitHUD()
@@ -185,10 +190,27 @@ struct ImmersiveSpaceView: View {
                     .environment(flight)
             }
             Attachment(id: "cockpitControls") {
-                CockpitControlPanel(
-                    isDetectionPickerPresented:
-                        $isDetectionPickerPresented
-                )
+                OutsideShipControlBar()
+                    .environment(flight)
+            }
+            Attachment(id: "consoleFarLeft") {
+                FlightConsoleFarLeftFacet()
+                    .environment(flight)
+            }
+            Attachment(id: "consoleLeft") {
+                FlightConsoleVideoFacet(title: "MONITOR")
+                    .environment(flight)
+            }
+            Attachment(id: "consoleCenter") {
+                FlightConsoleReadoutFacet()
+                    .environment(flight)
+            }
+            Attachment(id: "consoleRight") {
+                FlightConsoleSystemsFacet()
+                    .environment(flight)
+            }
+            Attachment(id: "consoleFarRight") {
+                FlightConsoleFarRightFacet()
                     .environment(flight)
             }
             Attachment(id: "targetContactPanel") {
@@ -242,6 +264,33 @@ struct ImmersiveSpaceView: View {
             flight.missileEntity = nil
             flight.clearAtmosphereEnvironment()
             flight.isImmersive = false
+        }
+    }
+
+    private func syncConsoleFacetUI(
+        _ attachments: RealityViewAttachments,
+        cockpit: Entity
+    ) {
+        let facets = [
+            ("consoleFarLeft", "Flight Console Far Left UI"),
+            ("consoleLeft", "Flight Console Left UI"),
+            ("consoleCenter", "Flight Console Center UI"),
+            ("consoleRight", "Flight Console Right UI"),
+            ("consoleFarRight", "Flight Console Far Right UI")
+        ]
+        for (id, anchorName) in facets {
+            guard let ui = attachments.entity(for: id),
+                  let anchor = cockpit.findEntity(named: anchorName) else {
+                continue
+            }
+            if ui.parent !== anchor {
+                anchor.addChild(ui)
+            }
+            ui.position = .zero
+            // Identity keeps the attachment's front toward the pilot.
+            // A 180° yaw showed the back face, so the labels read backwards.
+            ui.orientation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+            ui.scale = SIMD3<Float>(repeating: 1)
         }
     }
 }
@@ -431,6 +480,25 @@ private struct SurfaceInventoryView: View {
                 title: "Rover",
                 selection: flight.roverDominantHand
             ) { flight.setRoverDominantHand($0) }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle(isOn: Binding(
+                    get: { flight.showPeopleWhilePlaying },
+                    set: { flight.setShowPeopleWhilePlaying($0) }
+                )) {
+                    Text("Show people while playing")
+                        .font(.headline)
+                }
+                Text(
+                    "On by default. Uses progressive immersion so nearby"
+                        + " people can appear (Digital Crown adjusts immersion)."
+                        + " Also requires People Awareness in visionOS Settings"
+                        + " → Awareness & Safety → Show People Through"
+                        + " → Environments and Immersive Apps."
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            }
 
             if let prompt = flight.settingsResetPrompt {
                 resetDifficultyChooser(prompt)
@@ -726,7 +794,7 @@ private struct RefineryFabricatorView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(spacing: 10) {
                         Label(
-                            "REFINERY / FABRICATOR",
+                            "FABRICATOR",
                             systemImage: "hammer.fill"
                         )
                         .font(.headline.bold())
@@ -863,6 +931,9 @@ private struct RefineryFabricatorView: View {
         var notes: [String] = []
         if let recharge = recipe.energyCubeRecharge {
             notes.append("single-use +\(Int(recharge)) energy")
+        }
+        if let fuel = recipe.shipFuelAmount {
+            notes.append("+\(Int(fuel)) ship fuel")
         }
         if let bonus = recipe.energyCapacityBonus {
             notes.append("permanent +\(Int(bonus)) capacity")
@@ -1275,14 +1346,7 @@ private struct SurvivabilityHUD: View {
                     tint: .orange
                 )
             } else if !flight.isOutsideShip {
-                if flight.isShipShieldActive {
-                    meter(
-                        "SHIP SHIELD",
-                        value: flight.shipShield,
-                        maximum: 500,
-                        tint: .cyan
-                    )
-                }
+                // Ship shield meter lives on the center console above Shield.
                 meter(
                     "SHIP HULL",
                     value: flight.shipHull,
@@ -1474,355 +1538,559 @@ private extension View {
     }
 }
 
-private struct CockpitControlPanel: View {
+/// Floating bar for outside-ship actions (enter ship / rover / etc.).
+private struct OutsideShipControlBar: View {
     @Environment(FlightModel.self) private var flight
-    @Binding var isDetectionPickerPresented: Bool
-    @State private var isLeaveMenuPresented = false
+
+    private var shouldShow: Bool {
+        flight.isOutsideShip
+            && (
+                !flight.isSurfaceExploration
+                    || flight.activeExplorationMode == "Deploy rover"
+                    || flight.canEnterShip
+                    || flight.canEnterRover
+                    || flight.isFabricatorAvailable
+            )
+    }
 
     var body: some View {
         Group {
-            if shouldShowPanel {
-                VStack(spacing: 8) {
-                    // Bottom-bar menus raise upward above the button row.
-                    if !flight.isOutsideShip {
-                        if isDetectionPickerPresented {
-                            DetectionPicker(
-                                isPresented: $isDetectionPickerPresented
-                            )
-                            .environment(flight)
-                            .transition(
-                                .move(edge: .bottom).combined(with: .opacity)
-                            )
+            if shouldShow {
+                HStack(spacing: 12) {
+                    Label(
+                        flight.activeExplorationMode ?? "Outside ship",
+                        systemImage: "figure.walk"
+                    )
+                    .font(.headline)
+                    if flight.activeExplorationMode == "Deploy rover" {
+                        Button(
+                            "LEAVE ROVER",
+                            systemImage: "figure.walk"
+                        ) {
+                            flight.leaveRover()
                         }
-                        if isLeaveMenuPresented {
-                            leaveOptionsMenu
-                                .transition(
-                                    .move(edge: .bottom)
-                                        .combined(with: .opacity)
-                                )
-                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.orange)
                     }
-
-                    VStack(spacing: 8) {
-                        if flight.isOutsideShip {
-                            outsideShipControls
-                        } else {
-                            inShipControls
+                    if !flight.isSurfaceExploration || flight.canEnterShip {
+                        Button(
+                            "ENTER SHIP",
+                            systemImage: "airplane"
+                        ) {
+                            flight.returnToShip()
                         }
-
-                        if !flight.interactionStatus.isEmpty {
-                            Text(flight.interactionStatus)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.cyan)
-                                .lineLimit(1)
+                        .buttonStyle(.borderedProminent)
+                        .tint(.cyan)
+                    }
+                    if flight.canEnterRover {
+                        Button(
+                            "ENTER ROVER",
+                            systemImage: "car.side.fill"
+                        ) {
+                            flight.enterRover()
                         }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.orange)
                     }
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 12)
-                    .glassBackgroundEffect()
-                }
-                .frame(maxWidth: 980, alignment: .bottom)
-                // Fixed-height, bottom-aligned so raised menus grow upward
-                // without shifting the button row down in the attachment.
-                .frame(height: 430, alignment: .bottom)
-                .panelMenuExpansion(.bottomBarRaises)
-                .animation(
-                    .snappy(duration: 0.18),
-                    value: isLeaveMenuPresented
-                )
-                .animation(
-                    .snappy(duration: 0.18),
-                    value: isDetectionPickerPresented
-                )
-            }
-        }
-        .onChange(of: flight.isOutsideShip) { _, outside in
-            if outside {
-                isLeaveMenuPresented = false
-                isDetectionPickerPresented = false
-            }
-        }
-        .onChange(of: flight.canLeaveShip) { _, canLeave in
-            if !canLeave { isLeaveMenuPresented = false }
-        }
-        .onChange(of: flight.isRefineryPresented) { _, presented in
-            if presented {
-                isLeaveMenuPresented = false
-                isDetectionPickerPresented = false
-            }
-        }
-        .onChange(of: flight.isStationShopPresented) { _, presented in
-            if presented {
-                isLeaveMenuPresented = false
-                isDetectionPickerPresented = false
-            }
-        }
-    }
-
-    private var outsideShipControls: some View {
-        HStack(spacing: 12) {
-            Label(
-                flight.activeExplorationMode ?? "Outside ship",
-                systemImage: "figure.walk"
-            )
-            .font(.headline)
-            if flight.activeExplorationMode == "Deploy rover" {
-                Button(
-                    "LEAVE ROVER",
-                    systemImage: "figure.walk"
-                ) {
-                    flight.leaveRover()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.orange)
-            }
-            if !flight.isSurfaceExploration || flight.canEnterShip {
-                Button(
-                    "ENTER SHIP",
-                    systemImage: "airplane"
-                ) {
-                    flight.returnToShip()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.cyan)
-            }
-            if flight.canEnterRover {
-                Button(
-                    "ENTER ROVER",
-                    systemImage: "car.side.fill"
-                ) {
-                    flight.enterRover()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.orange)
-            }
-            if flight.isFabricatorAvailable {
-                Button(
-                    "REFINERY",
-                    systemImage: "hammer.fill"
-                ) {
-                    flight.openRefineryPanel()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.mint)
-            }
-        }
-    }
-
-    private var inShipControls: some View {
-        HStack(spacing: 10) {
-            Button(
-                flight.landingControlTitle,
-                systemImage: "arrow.up.and.down.circle.fill"
-            ) {
-                closeBottomMenus()
-                flight.performLandingControl()
-            }
-            .disabled(!flight.canUseLandingControl)
-            .tint(
-                flight.canUseLandingControl
-                    ? .cyan : .gray.opacity(0.35)
-            )
-
-            Button(flight.currentWeapon, systemImage: "scope") {
-                closeBottomMenus()
-                flight.cycleWeapon()
-            }
-            .disabled(!flight.canCycleWeapons)
-            .tint(
-                flight.canCycleWeapons ? .red : .gray.opacity(0.35)
-            )
-
-            Button(
-                flight.isShipShieldActive ? "SHIELD ON" : "SHIELD OFF",
-                systemImage: flight.isShipShieldActive
-                    ? "shield.fill" : "shield.slash"
-            ) {
-                closeBottomMenus()
-                flight.toggleShipShield()
-            }
-            .tint(flight.isShipShieldActive ? .blue : .gray)
-
-            Button {
-                isLeaveMenuPresented = false
-                isDetectionPickerPresented.toggle()
-            } label: {
-                Label(
-                    flight.hasNavModule
-                        ? "DETECT ∞"
-                        : "DETECT LOCKED",
-                    systemImage:
-                        "sensor.tag.radiowaves.forward.fill"
-                )
-            }
-            .disabled(!flight.canPresentDetectionPicker)
-            .tint(
-                flight.canUseDetection
-                    ? .green
-                    : .gray.opacity(0.35)
-            )
-
-            if flight.isFabricatorAvailable {
-                Button("REFINERY", systemImage: "hammer.fill") {
-                    closeBottomMenus()
-                    flight.openRefineryPanel()
-                }
-                .tint(.mint)
-            }
-
-            Button {
-                isDetectionPickerPresented = false
-                isLeaveMenuPresented.toggle()
-            } label: {
-                Label("LEAVE", systemImage: "figure.walk")
-            }
-            .disabled(!flight.canLeaveShip)
-            .tint(
-                flight.canLeaveShip
-                    ? .orange : .gray.opacity(0.35)
-            )
-        }
-        .buttonStyle(.borderedProminent)
-    }
-
-    private var leaveOptionsMenu: some View {
-        HStack {
-            Spacer(minLength: 0)
-            VStack(alignment: .trailing, spacing: 6) {
-                ForEach(
-                    flight.availableExitOptions,
-                    id: \.self
-                ) { option in
-                    Button(option) {
-                        flight.selectExitOption(option)
-                        isLeaveMenuPresented = false
+                    if flight.isFabricatorAvailable {
+                        Button(
+                            "FABRICATOR",
+                            systemImage: "hammer.fill"
+                        ) {
+                            flight.openRefineryPanel()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.mint)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.orange)
-                    .controlSize(.large)
                 }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 12)
+                .glassBackgroundEffect()
             }
-            .padding(10)
-            .background(.black.opacity(0.55))
-            .glassBackgroundEffect()
-            .clipShape(.rect(cornerRadius: 14))
         }
-        .panelMenuExpansion(.bottomBarRaises)
-    }
-
-    private func closeBottomMenus() {
-        isLeaveMenuPresented = false
-        isDetectionPickerPresented = false
-    }
-
-    private var shouldShowPanel: Bool {
-        !flight.isOutsideShip
-            || !flight.isSurfaceExploration
-            || flight.activeExplorationMode == "Deploy rover"
-            || flight.canEnterShip
-            || flight.canEnterRover
     }
 }
 
-private struct DetectionPicker: View {
+private struct FlightConsoleFarLeftFacet: View {
+    @Environment(FlightModel.self) private var flight
+
+    var body: some View {
+        Group {
+            if !flight.isOutsideShip {
+                consoleFacetChrome {
+                    ConsoleLampStation(
+                        caption: "AUTO-PILOT",
+                        padLabel: flight.autopilot
+                            || flight.isAutopilotMenuPresented
+                            ? "ON" : "OFF",
+                        isLit: flight.autopilot
+                            || flight.isAutopilotMenuPresented
+                            || flight.autopilotConsoleFlashing,
+                        litColor: .green,
+                        disabled: !flight.canPresentDetectionPicker
+                            && !flight.autopilot
+                    ) {
+                        flight.toggleAutopilotConsole()
+                    }
+                    .opacity(
+                        flight.autopilotConsoleFlashing
+                            && !flight.autopilot ? 0.45 : 1
+                    )
+
+                    ConsoleLampStation(
+                        caption: "FABRICATOR",
+                        padLabel: flight.consolePage == .fabricator
+                            ? "ON" : "OFF",
+                        isLit: flight.consolePage == .fabricator,
+                        litColor: .mint,
+                        disabled: !flight.isFabricatorAvailable
+                    ) {
+                        flight.toggleFabricatorConsole()
+                    }
+                }
+                .frame(width: 300, height: 480)
+            }
+        }
+    }
+}
+
+private struct FlightConsoleVideoFacet: View {
+    let title: String
+
+    var body: some View {
+        consoleFacetChrome {
+            Text(title)
+                .font(.caption.bold().monospaced())
+                .foregroundStyle(.cyan.opacity(0.35))
+            Spacer()
+        }
+        .frame(width: 300, height: 480)
+    }
+}
+
+private struct FlightConsoleReadoutFacet: View {
+    @Environment(FlightModel.self) private var flight
+
+    var body: some View {
+        Group {
+            if !flight.isOutsideShip {
+                consoleFacetChrome {
+                    switch flight.consolePage {
+                    case .fabricator:
+                        FabricatorReadout()
+                    case .autopilot:
+                        AutopilotCategoryReadout()
+                    case .autopilotPlanets:
+                        AutopilotPlanetReadout()
+                    case .autopilotStations:
+                        KnownTargetReadout(
+                            title: "STATIONS",
+                            nearestTitle: "NEAREST STATION",
+                            kind: .station
+                        )
+                    case .autopilotDebris:
+                        KnownTargetReadout(
+                            title: "SPACE DEBRIS",
+                            nearestTitle: "NEAREST DEBRIS",
+                            kind: .wreckage
+                        )
+                    case .engineStart:
+                        EngineAnimationReadout(starting: true)
+                    case .engineStop:
+                        EngineAnimationReadout(starting: false)
+                    case .standby:
+                        Text("SELECT A SYSTEM")
+                            .font(.caption.bold().monospaced())
+                            .foregroundStyle(.cyan.opacity(0.45))
+                        if !flight.interactionStatus.isEmpty {
+                            Text(flight.interactionStatus)
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.cyan)
+                                .multilineTextAlignment(.center)
+                        }
+                        Spacer()
+                    }
+                }
+                .frame(width: 340, height: 520)
+            }
+        }
+    }
+}
+
+private struct FabricatorReadout: View {
+    @Environment(FlightModel.self) private var flight
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("FABRICATOR")
+                .font(.caption.bold().monospaced())
+                .foregroundStyle(.mint)
+            Button("CONVERT LOGS → ENERGY") {
+                _ = flight.convertLogsToEnergy()
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.green)
+            .disabled(!flight.canConvertLogsToEnergy)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(ProgressionEconomy.craftRecipes) { recipe in
+                        Button(recipe.title) {
+                            _ = flight.craftRecipe(recipe.id)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.mint)
+                        .disabled(!flight.canCraftRecipe(recipe))
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct AutopilotCategoryReadout: View {
+    @Environment(FlightModel.self) private var flight
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("AUTO-PILOT")
+                .font(.caption.bold().monospaced())
+                .foregroundStyle(.green)
+            if !flight.hasNavModule {
+                Text(flight.detectionLockReason)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            } else {
+                Button("PLANET") { flight.consolePage = .autopilotPlanets }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                Button("STATION") { flight.consolePage = .autopilotStations }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.cyan)
+                Button("SPACE DEBRIS") { flight.consolePage = .autopilotDebris }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                Button("CLEAR TARGET") { flight.cancelAutopilotTarget() }
+                    .buttonStyle(.bordered)
+                    .tint(.red)
+                    .disabled(!flight.hasAutopilotTarget)
+            }
+            Spacer()
+        }
+    }
+}
+
+private struct AutopilotPlanetReadout: View {
+    @Environment(FlightModel.self) private var flight
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("PLANET")
+                .font(.caption.bold().monospaced())
+                .foregroundStyle(.green)
+            Button("NEAREST PLANET") {
+                flight.engageNearestPlanet()
+            }
+            Button("AIRLESS PLANET") {
+                flight.engageNearestPlanet(airless: true)
+            }
+            Button("GAS PLANET") {
+                flight.engageNearestPlanet(kind: .gas)
+            }
+            Button("ICE PLANET") {
+                flight.engageNearestPlanet(kind: .ice)
+            }
+            Button("FIRE PLANET") {
+                flight.engageNearestPlanet(kind: .desert)
+            }
+            Button("BACK") { flight.consolePage = .autopilot }
+                .tint(.secondary)
+            Spacer()
+        }
+        .buttonStyle(.borderedProminent)
+    }
+}
+
+private struct KnownTargetReadout: View {
+    @Environment(FlightModel.self) private var flight
+    let title: String
+    let nearestTitle: String
+    let kind: NavigationTargetKind
+
+    var body: some View {
+        let known = flight.knownConsoleDestinations(kind)
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.caption.bold().monospaced())
+                .foregroundStyle(.cyan)
+            Button(nearestTitle) {
+                flight.detectNearest(kind)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.green)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    if known.isEmpty {
+                        Text("No previous visits in range")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(known, id: \.identifier) { target in
+                        Button(
+                            "\(target.name)  \(Int(target.distance)) m"
+                        ) {
+                            flight.engageAutopilot(toward: target)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.cyan)
+                    }
+                }
+            }
+            Button("BACK") {
+                flight.consolePage = .autopilot
+            }
+            .buttonStyle(.bordered)
+            .tint(.secondary)
+        }
+    }
+}
+
+private struct EngineAnimationReadout: View {
+    let starting: Bool
+    @Environment(FlightModel.self) private var flight
+
+    var body: some View {
+        let progress = 1 - min(1, flight.engineAnimRemaining / 1.6)
+        VStack(spacing: 12) {
+            Text(starting ? "ENGINES STARTING" : "ENGINES SHUTTING DOWN")
+                .font(.caption.bold().monospaced())
+                .foregroundStyle(starting ? .cyan : .orange)
+            HStack(spacing: 8) {
+                ForEach(0..<5, id: \.self) { index in
+                    let lit = starting
+                        ? progress > Double(index) / 5
+                        : progress < Double(5 - index) / 5
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(lit ? Color.cyan : Color.white.opacity(0.12))
+                        .frame(width: 18, height: lit ? 70 : 24)
+                }
+            }
+            Spacer()
+        }
+    }
+}
+
+private struct FlightConsoleSystemsFacet: View {
+    @Environment(FlightModel.self) private var flight
+
+    var body: some View {
+        Group {
+            if !flight.isOutsideShip {
+                consoleFacetChrome {
+                    ConsoleLampStation(
+                        caption: flight.isWeaponArmed
+                            ? flight.currentWeapon
+                            : " ",
+                        padLabel: flight.isWeaponArmed ? "ARMED" : "DISARMED",
+                        isLit: flight.isWeaponArmed,
+                        litColor: .red,
+                        disabled: !flight.canCycleWeapons
+                    ) {
+                        flight.cycleWeapon()
+                    }
+
+                    VStack(spacing: 6) {
+                        HStack(spacing: 8) {
+                            Text("SHIELD")
+                                .font(.caption2.bold().monospaced())
+                                .foregroundStyle(.secondary)
+                            ProgressView(
+                                value: Double(max(0, flight.shipShield)),
+                                total: 500
+                            )
+                            .tint(.cyan)
+                            Text("\(Int(flight.shipShield.rounded()))")
+                                .font(.caption2.monospacedDigit())
+                                .frame(width: 36, alignment: .trailing)
+                        }
+                        .opacity(flight.isShipShieldActive ? 1 : 0.45)
+
+                        ConsoleLampStation(
+                            caption: "SHIELD",
+                            padLabel: flight.isShipShieldActive ? "ON" : "OFF",
+                            isLit: flight.isShipShieldActive,
+                            litColor: .blue,
+                            disabled: false
+                        ) {
+                            flight.toggleShipShield()
+                        }
+                    }
+                }
+                .frame(width: 300, height: 480)
+            }
+        }
+    }
+}
+
+private struct FlightConsoleFarRightFacet: View {
+    @Environment(FlightModel.self) private var flight
+    @State private var isExitMenuPresented = false
+
+    var body: some View {
+        Group {
+            if !flight.isOutsideShip {
+                VStack(spacing: 8) {
+                    if isExitMenuPresented {
+                        VStack(alignment: .trailing, spacing: 6) {
+                            ForEach(flight.availableExitOptions, id: \.self) { option in
+                                Button(option) {
+                                    flight.selectExitOption(option)
+                                    isExitMenuPresented = false
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.orange)
+                            }
+                        }
+                    }
+                    consoleFacetChrome {
+                        ConsoleLampStation(
+                            caption: "ENGINES",
+                            padLabel: flight.enginesRunning ? "ON" : "OFF",
+                            isLit: flight.enginesRunning,
+                            litColor: .cyan,
+                            disabled: false
+                        ) {
+                            flight.toggleShipEngines()
+                        }
+
+                        ConsoleLampStation(
+                            caption: "EXIT",
+                            padLabel: "EXIT",
+                            isLit: flight.canLeaveShip,
+                            litColor: .orange,
+                            disabled: !flight.canLeaveShip
+                        ) {
+                            isExitMenuPresented.toggle()
+                        }
+                    }
+                }
+                .frame(width: 300, height: 520, alignment: .bottom)
+            }
+        }
+        .onChange(of: flight.isLanded) { _, landed in
+            if landed { isExitMenuPresented = true }
+        }
+        .onChange(of: flight.canLeaveShip) { _, canLeave in
+            if !canLeave { isExitMenuPresented = false }
+        }
+    }
+}
+
+private func consoleFacetChrome<Content: View>(
+    @ViewBuilder content: () -> Content
+) -> some View {
+    VStack(spacing: 14) {
+        content()
+    }
+    .padding(16)
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(Color(red: 0.05, green: 0.07, blue: 0.10))
+}
+
+private struct ConsoleLampStation: View {
+    let caption: String
+    let padLabel: String
+    let isLit: Bool
+    let litColor: Color
+    let disabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Text(caption)
+                .font(.caption.bold().monospaced())
+                .foregroundStyle(Color.cyan.opacity(0.7))
+                .frame(maxWidth: .infinity)
+            Button(action: action) {
+                Text(padLabel)
+                    .font(.headline.bold().monospaced())
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity, minHeight: 56)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(isLit ? litColor : Color(white: 0.22))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .strokeBorder(
+                                isLit ? Color.white : Color(white: 0.45),
+                                lineWidth: 2
+                            )
+                    )
+            }
+            .buttonStyle(.plain)
+            .disabled(disabled)
+            .opacity(disabled ? 0.4 : 1)
+        }
+    }
+}
+
+private struct AutopilotDestinationPicker: View {
     @Environment(FlightModel.self) private var flight
     @Binding var isPresented: Bool
 
     var body: some View {
-        if isPresented && !flight.isOutsideShip {
-            VStack(spacing: 12) {
-                Label(
-                    "FIND NEAREST",
-                    systemImage: "sensor.tag.radiowaves.forward.fill"
-                )
-                .font(.title3.bold())
+        VStack(spacing: 10) {
+            Text("AUTO-PILOT TARGET")
+                .font(.caption.bold().monospaced())
+                .foregroundStyle(.green)
 
-                if !flight.hasNavModule {
-                    Text(flight.detectionLockReason)
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .multilineTextAlignment(.center)
-                    Button("CLOSE", systemImage: "xmark.circle.fill") {
+            if !flight.hasNavModule {
+                Text(flight.detectionLockReason)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .multilineTextAlignment(.center)
+            } else {
+                VStack(spacing: 6) {
+                    destinationButton("PLANET", kind: .world)
+                    Button("AIRLESS PLANET") {
+                        flight.detectNearestAirlessPlanet()
                         isPresented = false
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(.secondary)
-                } else {
-                    HStack(spacing: 12) {
-                        detectionButton(
-                            "PLANET",
-                            systemImage: "globe.americas.fill",
-                            kind: .world
-                        )
-                        Button(
-                            "AIRLESS PLANET",
-                            systemImage: "moon.stars.fill"
-                        ) {
-                            flight.detectNearestAirlessPlanet()
-                            isPresented = false
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.indigo)
-                        .controlSize(.large)
+                    .tint(.indigo)
+                    destinationButton("STATION", kind: .station)
+                    destinationButton("WRECKAGE", kind: .wreckage)
+                    Button("CLEAR TARGET") {
+                        flight.cancelAutopilotTarget()
+                        isPresented = false
                     }
-
-                    HStack(spacing: 12) {
-                        detectionButton(
-                            "STATION",
-                            systemImage: "building.2.fill",
-                            kind: .station
-                        )
-                        detectionButton(
-                            "WRECKAGE",
-                            systemImage: "exclamationmark.triangle.fill",
-                            kind: .wreckage
-                        )
-                    }
-
-                    HStack(spacing: 12) {
-                        Button(
-                            "CANCEL CURRENT TARGET",
-                            systemImage: "scope"
-                        ) {
-                            flight.cancelAutopilotTarget()
-                            isPresented = false
-                        }
-                        .disabled(!flight.hasAutopilotTarget)
-                        .tint(
-                            flight.hasAutopilotTarget
-                                ? .red
-                                : .gray.opacity(0.35)
-                        )
-
-                        Button("CLOSE", systemImage: "xmark.circle.fill") {
-                            isPresented = false
-                        }
-                        .tint(.secondary)
-                    }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.bordered)
+                    .tint(.red)
+                    .disabled(!flight.hasAutopilotTarget)
                 }
             }
-            .padding(16)
-            .frame(maxWidth: .infinity)
-            .background(.black.opacity(0.55))
-            .glassBackgroundEffect()
-            .clipShape(.rect(cornerRadius: 14))
-            .panelMenuExpansion(.bottomBarRaises)
+
+            Button("CLOSE") { isPresented = false }
+                .buttonStyle(.bordered)
+                .tint(.secondary)
         }
+        .padding(12)
+        .frame(maxWidth: .infinity)
+        .background(Color.black.opacity(0.78))
+        .clipShape(.rect(cornerRadius: 12))
+        .panelMenuExpansion(.bottomBarRaises)
     }
 
-    private func detectionButton(
+    private func destinationButton(
         _ title: String,
-        systemImage: String,
         kind: NavigationTargetKind
     ) -> some View {
-        Button(title, systemImage: systemImage) {
+        Button(title) {
             flight.detectNearest(kind)
             isPresented = false
         }
         .buttonStyle(.borderedProminent)
         .tint(.green)
-        .controlSize(.large)
     }
 }
 
@@ -1906,6 +2174,23 @@ private final class ControllerObserver {
         let now = ProcessInfo.processInfo.systemUptime
         let dt = Float(min(0.05, max(0, now - lastToolUpdateTime)))
         lastToolUpdateTime = now
+        // Gamepad fallback: pose equipped inventory (Relic Key beam origin)
+        // only when hand tracking hasn't updated recently.
+        let handPoseAge =
+            now - flight.lastHeldInventoryHandPoseTime
+        if flight.equippedInventoryItem != nil,
+           handPoseAge > 0.28,
+           let head = flight.aimAnchorEntity {
+            let forward = head.orientation.act(SIMD3<Float>(0, 0, -1))
+            let origin =
+                head.position(relativeTo: nil)
+                + forward * 0.32
+                + SIMD3<Float>(0, -0.12, 0)
+            flight.updateHeldInventoryItemPose(
+                position: origin,
+                pointingDirection: forward
+            )
+        }
         let pressed = rightTriggerValue > 0.35
         flight.updateControllerSurfaceTool(
             pressed: pressed,
@@ -1948,7 +2233,13 @@ private final class ControllerObserver {
         gamepad.rightThumbstick.xAxis.valueChangedHandler = { [weak self] _, value in
             Task { @MainActor in
                 guard let self, let flight = self.flight else { return }
-                if flight.isPaused || flight.isSurfaceExploration {
+                if flight.isPaused
+                    || flight.isSurfaceExploration
+                    || flight.autopilot
+                    || !flight.enginesRunning {
+                    if !flight.enginesRunning {
+                        flight.rollInput = 0
+                    }
                     return
                 }
                 flight.rollInput = Double(value)
@@ -1959,6 +2250,8 @@ private final class ControllerObserver {
                 guard let self, let flight = self.flight else { return }
                 self.rightTriggerValue = value
                 if flight.isPaused
+                    || flight.autopilot
+                    || !flight.enginesRunning
                     || flight.activeExplorationMode == "Leave on foot"
                     || flight.activeExplorationMode == "Deploy rover" {
                     return
@@ -1970,6 +2263,8 @@ private final class ControllerObserver {
             Task { @MainActor in
                 guard let flight = self?.flight,
                       !flight.isPaused,
+                      !flight.autopilot,
+                      flight.enginesRunning,
                       !flight.isSurfaceExploration else { return }
                 if value > 0.08 {
                     flight.throttle = Double(-value * 0.5)
@@ -1989,7 +2284,11 @@ private final class ControllerObserver {
                     flight.leaveRover()
                     return
                 }
-                flight.autopilot.toggle()
+                if flight.hasAutopilotTarget {
+                    flight.toggleAutopilotFromConsole()
+                } else {
+                    flight.autopilot = false
+                }
             }
         }
         gamepad.buttonB.pressedChangedHandler = { [weak self] _, _, pressed in
@@ -2076,6 +2375,12 @@ private final class ControllerObserver {
                 forward: Double(leftStickY),
                 turn: Double(leftStickX)
             )
+            return
+        }
+        if flight.autopilot || !flight.enginesRunning {
+            flight.yawInput = 0
+            flight.pitchInput = 0
+            flight.rollInput = 0
             return
         }
         flight.yawInput = Double(-leftStickX)

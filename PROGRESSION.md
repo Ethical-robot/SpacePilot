@@ -41,7 +41,7 @@ Opening the refinery hides the inventory kit and both aiming/directional crossha
 - Relics spawn as mineral-looking formations (`|relic` tag).
 - **Analyzer** scan confirms “RELIC” and marks the resource scanned.
 - Intact pickup requires a **Relic Key** (rare crumbler drop); key fuses on pickup.
-- Equipped Relic Key draws a ~3 m locator line toward the nearest Relic.
+- Equipped Relic Key draws a ~3 m purple locator beam from the held key toward the nearest Relic formation.
 - Outcomes: sell for high Mon, **OPEN RELIC** for blueprints/modules/materials, or crumbler-breakdown for Relic Fragments.
 - Scanning any mineral/tree before harvest grants **+33%** yield.
 

@@ -74,6 +74,19 @@ private struct PlayerSettingsSnapshot: Codable {
     var walkingDominantHand: String
     var roverDominantHand: String
     var difficulty: String
+    /// Prefer seeing people / surroundings while immersed. Missing = on.
+    var showPeopleWhilePlaying: Bool?
+}
+
+enum FlightConsolePage: Equatable, Sendable {
+    case standby
+    case fabricator
+    case autopilot
+    case autopilotPlanets
+    case autopilotStations
+    case autopilotDebris
+    case engineStart
+    case engineStop
 }
 
 enum SettingsResetPrompt: Equatable, Sendable {
@@ -356,6 +369,9 @@ final class FlightModel {
     var shipDominantHand: DominantHandSetting = .right
     var walkingDominantHand: DominantHandSetting = .right
     var roverDominantHand: DominantHandSetting = .right
+    /// Progressive immersion so People Awareness / Crown can reveal people.
+    /// Off locks full immersion. Default on.
+    var showPeopleWhilePlaying = true
     /// Confirmation sheet inside settings (`nil` = none).
     var settingsResetPrompt: SettingsResetPrompt?
     /// Tools available for the current difficulty / unlocks.
@@ -469,6 +485,9 @@ final class FlightModel {
     @ObservationIgnored var surfaceRoverPosition: GalacticPosition?
     @ObservationIgnored var surfaceToolMenuEntity: Entity?
     @ObservationIgnored var heldSurfaceToolEntity: Entity?
+    /// Tool-menu slot currently held down by the index tip (−1 = none).
+    /// Tool-menu plate latched down for the currently selected tool.
+    @ObservationIgnored private var pressedSurfaceToolSlotIndex: Int = -1
     @ObservationIgnored var heldInventoryItemEntity: Entity?
     @ObservationIgnored private var inventoryDismissedForCurrentGesture = false
     @ObservationIgnored private var surfaceProjectiles:
@@ -488,6 +507,14 @@ final class FlightModel {
     @ObservationIgnored private var automatedTargetIdentifier: String?
     @ObservationIgnored private var landingLevelElapsed: Float = 0
     @ObservationIgnored private var takeoffTargetDistance: Float = 0
+    /// Autopilot: countdown while warning about low fuel before hyper.
+    @ObservationIgnored private var autopilotFuelWarningRemaining: Double = 0
+    /// Autopilot: 3 s charge before hyper (same as manual turbo).
+    @ObservationIgnored private var autopilotHyperChargeRemaining: Double = 0
+    /// Autopilot: flash pad three times on arrival before disengaging.
+    @ObservationIgnored private var autopilotArrivalFlashRemaining: Double = 0
+    @ObservationIgnored private var autopilotPendingHyper = false
+    @ObservationIgnored private var consolePageBeforeEngine: FlightConsolePage = .standby
     @ObservationIgnored private var savedLocationCheckpoint:
         LocationCheckpoint?
     @ObservationIgnored private var checkpointSaveAccumulator: Float = 0
@@ -566,10 +593,31 @@ final class FlightModel {
                 * atmosphericBoostBlend
     }
     var isConsumingHyperFuel: Bool { isBoosting }
-    var currentWeaponType: ShipWeapon { equippedWeapons[currentWeaponIndex] }
-    var currentWeapon: String { currentWeaponType.rawValue }
-    var reticleDiameter: CGFloat { currentWeaponType.reticleDiameter }
+    /// `currentWeaponIndex == equippedWeapons.count` means disarmed.
+    /// Engines off forces the weapon off without changing that selection.
+    var isWeaponArmed: Bool {
+        enginesRunning
+            && currentWeaponIndex >= 0
+            && currentWeaponIndex < equippedWeapons.count
+    }
+    var currentWeaponType: ShipWeapon {
+        guard isWeaponArmed else { return .laser }
+        return equippedWeapons[currentWeaponIndex]
+    }
+    var currentWeapon: String {
+        isWeaponArmed ? currentWeaponType.rawValue : "DISARMED"
+    }
+    var reticleDiameter: CGFloat {
+        isWeaponArmed ? currentWeaponType.reticleDiameter : 150
+    }
     var hasAutopilotTarget: Bool { lockedTargetIdentifier != nil }
+    /// Console pad blink while AP warns or finishes arrival.
+    var autopilotConsoleFlashing = false
+    /// Propulsion. Off in space holds course and speed with no fuel use.
+    /// Hyperdrive shuts down when engines are off.
+    var enginesRunning = true
+    var consolePage: FlightConsolePage = .standby
+    var engineAnimRemaining: Double = 0
     var isOutsideShip: Bool { activeExplorationMode != nil }
     var isSurfaceExploration: Bool {
         activeExplorationMode == "Deploy rover"
@@ -628,7 +676,7 @@ final class FlightModel {
         }
     }
     var canCycleWeapons: Bool {
-        !isDocked && !isLanded && !isAutomatedFlightManeuver
+        enginesRunning && !isAutomatedFlightManeuver
     }
     var canPresentDetectionPicker: Bool {
         !isDocked && !isLanded && !isAutomatedFlightManeuver
@@ -644,10 +692,10 @@ final class FlightModel {
     var hasRoverRefinery: Bool {
         ownedModuleIDs.contains(ProgressionEconomy.roverRefineryModuleID)
     }
-    /// Ship: docked or landed in cockpit. Rover: only after Rover Refinery upgrade.
+    /// Ship: available in cockpit including free flight. Rover: Rover Refinery upgrade.
     var isFabricatorAvailable: Bool {
         guard !isShipDestroyed else { return false }
-        if !isOutsideShip && (isDocked || isLanded) {
+        if !isOutsideShip {
             return true
         }
         return activeExplorationMode == "Deploy rover" && hasRoverRefinery
@@ -813,6 +861,9 @@ final class FlightModel {
         targetContacts = []
         lastTick = .now
         checkpointSaveAccumulator = 0
+        // Startup is always landed or docked. Engines stay off until the pad
+        // is pressed; the checkpoint does not store this flag.
+        enginesRunning = false
         restoreSavedLocation()
         universeStreamer?.update(around: playerPosition.sector)
         ensureSafeSpawnOutsideStarHazard()
@@ -911,6 +962,7 @@ final class FlightModel {
         }
         inventoryDismissedForCurrentGesture = false
         inventoryVisible = true
+        updateWeaponReticleVisual()
         interactionStatus =
             isPaused ? "Paused • Settings" : "Settings"
     }
@@ -941,6 +993,11 @@ final class FlightModel {
         roverDominantHand = hand
         persistPlayerSettings()
         dominantHandName = dominantHandSettingForCurrentMode.rawValue
+    }
+
+    func setShowPeopleWhilePlaying(_ enabled: Bool) {
+        showPeopleWhilePlaying = enabled
+        persistPlayerSettings()
     }
 
     func beginSettingsResetPrompt(_ prompt: SettingsResetPrompt) {
@@ -1015,6 +1072,8 @@ final class FlightModel {
         gameOverSubtitle = ""
         setWeaponTrigger(false)
         stop()
+        enginesRunning = false
+        consolePage = .standby
         dockAtStartingStation()
         universeStreamer?.update(around: playerPosition.sector)
         applyCameraTransform()
@@ -1031,11 +1090,11 @@ final class FlightModel {
             interactionStatus =
                 activeExplorationMode == "Deploy rover"
                     ? "Install Rover Refinery Module at a station first"
-                    : "Refinery available when docked or landed in the ship"
+                    : "Fabricator unavailable"
             return
         }
         // Hide the loadout kit so its closer attachment cannot steal hits
-        // from the refinery panel (that looked like a frozen / unclosable UI).
+        // from the fabricator panel (that looked like a frozen / unclosable UI).
         inventoryVisible = false
         inventoryDismissedForCurrentGesture = true
         isSettingsMenuPresented = false
@@ -1088,6 +1147,7 @@ final class FlightModel {
             walkingDominantHand = .right
             roverDominantHand = .right
             gameDifficulty = .normal
+            showPeopleWhilePlaying = true
             dominantHandName = DominantHandSetting.right.rawValue
             return
         }
@@ -1100,6 +1160,7 @@ final class FlightModel {
             DominantHandSetting(rawValue: snapshot.roverDominantHand) ?? .right
         gameDifficulty =
             GameDifficulty(rawValue: snapshot.difficulty) ?? .normal
+        showPeopleWhilePlaying = snapshot.showPeopleWhilePlaying ?? true
         dominantHandName = dominantHandSettingForCurrentMode.rawValue
     }
 
@@ -1110,7 +1171,8 @@ final class FlightModel {
             shipDominantHand: shipDominantHand.rawValue,
             walkingDominantHand: walkingDominantHand.rawValue,
             roverDominantHand: roverDominantHand.rawValue,
-            difficulty: gameDifficulty.rawValue
+            difficulty: gameDifficulty.rawValue,
+            showPeopleWhilePlaying: showPeopleWhilePlaying
         )
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         defaults.set(data, forKey: Self.settingsStorageKey)
@@ -1230,7 +1292,7 @@ final class FlightModel {
 
     func convertLogsToEnergy(maxLogs: Int = 50) -> Int {
         guard isFabricatorAvailable else {
-            interactionStatus = "Convert organics while docked or landed"
+            interactionStatus = "Fabricator unavailable"
             return 0
         }
         var converted = 0
@@ -1291,7 +1353,9 @@ final class FlightModel {
         let mult = ProgressionEconomy.fuelCostMultiplier(
             difficulty: gameDifficulty
         )
-        guard mult > 0, !isOutsideShip, !isDocked, !isLanded else { return }
+        guard mult > 0, enginesRunning, !isOutsideShip, !isDocked, !isLanded else {
+            return
+        }
         var rate: Float = 0
         if isBoosting {
             rate = ProgressionEconomy.hyperFuelPerSecond
@@ -1307,10 +1371,16 @@ final class FlightModel {
                 cancelHyperDriveCharge()
                 interactionStatus = "Fuel empty • hyperdrive offline"
             }
+            // Limp both directions equally — an upper-only clamp used to leave
+            // reverse uncapped, so backing away from a planet felt faster than
+            // flying forward (and hyperdrive stays offline until refuel).
             if throttle > 0.25 {
                 throttle = 0.18
+            } else if throttle < -0.25 {
+                throttle = -0.18
             }
-            speed = min(speed, maximumForwardSpeed * 0.22)
+            let limpSpeed = maximumForwardSpeed * 0.22
+            speed = max(-limpSpeed, min(limpSpeed, speed))
         }
     }
 
@@ -1412,7 +1482,7 @@ final class FlightModel {
         guard isFabricatorAvailable,
               let index = inventoryItems.firstIndex(where: { $0.id == itemID })
         else {
-            interactionStatus = "Refine while docked or landed in the ship"
+            interactionStatus = "Fabricator unavailable"
             return false
         }
         let item = inventoryItems[index]
@@ -1495,6 +1565,17 @@ final class FlightModel {
                 )
             )
         }
+        if recipe.combustibleMineralCost > 0 {
+            rows.append(
+                (
+                    id: "combustibles",
+                    label:
+                        "\(recipe.combustibleMineralCost)× combustible mineral",
+                    satisfied: combustibleMineralQuantity()
+                        >= recipe.combustibleMineralCost
+                )
+            )
+        }
         return rows
     }
 
@@ -1520,6 +1601,9 @@ final class FlightModel {
         if recipe.anyMineralCost > 0 {
             consumeCategory(.mineral, count: recipe.anyMineralCost)
         }
+        if recipe.combustibleMineralCost > 0 {
+            consumeCombustibleMinerals(count: recipe.combustibleMineralCost)
+        }
         if let tool = recipe.unlocksTool {
             unlockedSurfaceToolIndices.insert(tool.rawIndex)
         }
@@ -1531,6 +1615,18 @@ final class FlightModel {
         }
         if let recharge = recipe.energyCubeRecharge {
             addEnergyCubeToInventory(recharge: recharge, title: recipe.title)
+        }
+        if let fuel = recipe.shipFuelAmount, fuel > 0 {
+            let before = shipFuel
+            shipFuel = min(ProgressionEconomy.maxShipFuel, shipFuel + fuel)
+            let gained = shipFuel - before
+            interactionStatus =
+                "Fabricated \(recipe.title) • +\(Int(gained.rounded())) fuel "
+                + "(\(Int(shipFuel))/\(Int(ProgressionEconomy.maxShipFuel)))"
+            persistInventory()
+            updateSelectedSurfaceToolVisual()
+            closeRefineryPanel(clearStatus: false)
+            return true
         }
         if let bonus = recipe.energyCapacityBonus, bonus > 0 {
             energyStorageExpansions = min(
@@ -1603,6 +1699,18 @@ final class FlightModel {
                     + " (have \(have))"
             }
         }
+        if recipe.combustibleMineralCost > 0 {
+            let have = combustibleMineralQuantity()
+            if have < recipe.combustibleMineralCost {
+                return "Need \(recipe.combustibleMineralCost)× "
+                    + "combustible mineral (have \(have))"
+            }
+        }
+        if let fuel = recipe.shipFuelAmount, fuel > 0 {
+            guard shipFuel < ProgressionEconomy.maxShipFuel - 0.5 else {
+                return "Fuel tanks full"
+            }
+        }
         if let recharge = recipe.energyCubeRecharge {
             let canStack = inventoryItems.contains {
                 $0.isEnergyCube
@@ -1630,6 +1738,41 @@ final class FlightModel {
         inventoryItems
             .filter { $0.category == category }
             .reduce(0) { $0 + $1.quantity }
+    }
+
+    private func combustibleMineralQuantity() -> Int {
+        inventoryItems
+            .filter {
+                $0.category == .mineral
+                    && ProgressionEconomy.isCombustibleMineral(
+                        materialName: $0.materialName
+                    )
+            }
+            .reduce(0) { $0 + $1.quantity }
+    }
+
+    private func consumeCombustibleMinerals(count: Int) {
+        var remaining = count
+        while remaining > 0,
+              let index = inventoryItems.firstIndex(where: {
+                  $0.category == .mineral
+                      && $0.quantity > 0
+                      && ProgressionEconomy.isCombustibleMineral(
+                          materialName: $0.materialName
+                      )
+              }) {
+            let take = min(remaining, inventoryItems[index].quantity)
+            inventoryItems[index].quantity -= take
+            remaining -= take
+            if inventoryItems[index].quantity <= 0 {
+                let removedID = inventoryItems[index].id
+                inventoryItems.remove(at: index)
+                if equippedInventoryItemID == removedID {
+                    equippedInventoryItemID = nil
+                }
+            }
+        }
+        rebuildCollectedItemCounts()
     }
 
     private func consumeElement(named name: String, count: Int) {
@@ -1938,6 +2081,7 @@ final class FlightModel {
     }
 
     private func forceRecoveryToShip() {
+        stowHeldHandItem()
         if let shipPosition = landedShipPosition {
             playerPosition = shipPosition
         }
@@ -1961,6 +2105,18 @@ final class FlightModel {
 
     func setWeaponTrigger(_ pressed: Bool) {
         guard !pressed || !isAutomatedFlightManeuver else { return }
+        guard !pressed || isWeaponArmed else {
+            if isTriggerPressed {
+                isTriggerPressed = false
+                fireButtonEntity?.position.y = 0.324
+                laserEntity?.isEnabled = false
+                slowBeamEntity?.isEnabled = false
+                isLaserFiring = false
+                slowBeamTargetName = nil
+                slowBeamEffectPercent = 0
+            }
+            return
+        }
         guard pressed != isTriggerPressed else { return }
         isTriggerPressed = pressed
         fireButtonEntity?.position.y = pressed ? 0.316 : 0.324
@@ -2051,6 +2207,10 @@ final class FlightModel {
     }
 
     func updateHyperDriveCharge(remaining: Double) {
+        guard enginesRunning else {
+            cancelHyperDriveCharge()
+            return
+        }
         guard !isWithinPlanetAtmosphere else {
             cancelHyperDriveCharge()
             return
@@ -2061,6 +2221,10 @@ final class FlightModel {
     }
 
     func activateHyperDrive() {
+        guard enginesRunning else {
+            cancelHyperDriveCharge()
+            return
+        }
         guard !isWithinPlanetAtmosphere else {
             cancelHyperDriveCharge()
             return
@@ -2106,9 +2270,17 @@ final class FlightModel {
     }
 
     func cycleWeapon() {
+        guard canCycleWeapons else { return }
         setWeaponTrigger(false)
-        currentWeaponIndex = (currentWeaponIndex + 1) % equippedWeapons.count
-        interactionStatus = "\(currentWeapon) selected"
+        // Cycle equipped weapons, then Disarmed, then back to the first weapon.
+        let slotCount = equippedWeapons.count + 1
+        currentWeaponIndex = (currentWeaponIndex + 1) % slotCount
+        interactionStatus =
+            isWeaponArmed
+                ? "\(currentWeapon) armed"
+                : "Weapons disarmed"
+        lastReticleWeaponIndex = nil
+        updateWeaponReticleVisual()
     }
 
     private func fireMissile() {
@@ -2211,10 +2383,7 @@ final class FlightModel {
             interactionStatus = "No \(kind.displayName.lowercased()) detected nearby"
             return
         }
-        lockedTargetIdentifier = target.identifier
-        lockedTargetName = target.name
-        autopilot = true
-        interactionStatus = "Autopilot locked: \(target.name)"
+        engageAutopilot(toward: target)
     }
 
     func detectNearestAirlessPlanet() {
@@ -2226,36 +2395,374 @@ final class FlightModel {
             interactionStatus = "No airless planet detected nearby"
             return
         }
-        lockedTargetIdentifier = target.identifier
-        lockedTargetName = target.name
-        autopilot = true
-        interactionStatus =
-            "Autopilot locked: \(target.name) • AIRLESS PLANET"
+        engageAutopilot(toward: target)
     }
 
     func cancelAutopilotTarget() {
         lockedTargetIdentifier = nil
         lockedTargetName = nil
-        autopilot = false
+        disengageAutopilot(keepTarget: false)
+    }
+
+    /// Console Auto-Pilot pad: open picker when no target; else toggle engage.
+    func toggleAutopilotFromConsole() {
+        if autopilot {
+            disengageAutopilot(keepTarget: true)
+            interactionStatus = "Auto-Pilot off • manual flight"
+            return
+        }
+        guard hasAutopilotTarget,
+              let identifier = lockedTargetIdentifier,
+              let target = universeStreamer?.destination(
+                identifiedBy: identifier,
+                to: playerPosition
+              ) else {
+            return
+        }
+        engageAutopilot(toward: target)
     }
 
     func continueTowardContact(_ contact: TargetContact) {
-        guard universeStreamer?.destination(
+        guard let target = universeStreamer?.destination(
             identifiedBy: contact.id,
             to: playerPosition
-        ) != nil else {
+        ) else {
             interactionStatus = "\(contact.name) is no longer in sensor range"
             return
         }
-        lockedTargetIdentifier = contact.id
-        lockedTargetName = contact.name
-        autopilot = true
-        interactionStatus = "Continuing toward \(contact.name)"
+        engageAutopilot(toward: target)
     }
 
     func changeTrajectory() {
         cancelAutopilotTarget()
         interactionStatus = "Autopilot released • Change trajectory manually"
+    }
+
+    func engageAutopilot(toward target: NearbyNavigationTarget) {
+        lockedTargetIdentifier = target.identifier
+        lockedTargetName = target.name
+        autopilotFuelWarningRemaining = 0
+        autopilotHyperChargeRemaining = 0
+        autopilotArrivalFlashRemaining = 0
+        autopilotPendingHyper = false
+        autopilotConsoleFlashing = false
+
+        let stopDistance = autopilotStopDistance(for: target)
+        let travelDistance = max(0, target.distance - stopDistance)
+        if travelDistance <= 2 {
+            beginAutopilotArrivalFlash(message: "Arrived at \(target.name)")
+            return
+        }
+
+        let requiredFuel = estimatedAutopilotFuel(
+            travelDistance: travelDistance,
+            useHyper: canAutopilotUseHyper(travelDistance: travelDistance)
+        )
+        let fuelMult = max(
+            0.0001,
+            ProgressionEconomy.fuelCostMultiplier(difficulty: gameDifficulty)
+        )
+        // Creative (0 cost) always has enough fuel.
+        let effectiveRequired =
+            fuelMult <= 0.0001 ? 0 : requiredFuel
+
+        if shipFuel + 0.05 < effectiveRequired {
+            autopilot = false
+            interactionStatus =
+                "Auto-Pilot cancelled • need \(Int(ceil(effectiveRequired))) fuel"
+                    + " for this jump (have \(Int(shipFuel.rounded())))"
+            return
+        }
+
+        autopilot = true
+        pitchInput = 0
+        yawInput = 0
+        rollInput = 0
+
+        let useHyper = canAutopilotUseHyper(travelDistance: travelDistance)
+        if !useHyper {
+            interactionStatus = "Auto-Pilot on • cruising to \(target.name)"
+            return
+        }
+
+        if effectiveRequired > 0, shipFuel < effectiveRequired * 2 {
+            autopilotFuelWarningRemaining = 3
+            autopilotPendingHyper = true
+            autopilotConsoleFlashing = true
+            interactionStatus =
+                "Low fuel for jump • recommend cancel • "
+                    + "\(Int(shipFuel.rounded())) / "
+                    + "\(Int(ceil(effectiveRequired * 2))) recommended"
+            return
+        }
+
+        beginAutopilotHyperCharge()
+        interactionStatus = "Auto-Pilot • hyperspace to \(target.name)"
+    }
+
+    private func disengageAutopilot(keepTarget: Bool) {
+        autopilot = false
+        autopilotFuelWarningRemaining = 0
+        autopilotHyperChargeRemaining = 0
+        autopilotArrivalFlashRemaining = 0
+        autopilotPendingHyper = false
+        autopilotConsoleFlashing = false
+        if isBoosting || isHyperDriveCharging {
+            cancelHyperDriveCharge()
+        }
+        if !keepTarget {
+            lockedTargetIdentifier = nil
+            lockedTargetName = nil
+        }
+    }
+
+    private func beginAutopilotHyperCharge() {
+        autopilotPendingHyper = false
+        autopilotFuelWarningRemaining = 0
+        autopilotHyperChargeRemaining = 3
+        autopilotConsoleFlashing = false
+        updateHyperDriveCharge(remaining: 3)
+    }
+
+    private func beginAutopilotArrivalFlash(message: String) {
+        autopilot = false
+        if isBoosting || isHyperDriveCharging {
+            cancelHyperDriveCharge()
+        }
+        throttle = 0
+        speed = min(speed, maximumForwardSpeed * 0.2)
+        autopilotArrivalFlashRemaining = 1.2
+        autopilotConsoleFlashing = true
+        interactionStatus = message
+    }
+
+    private func canAutopilotUseHyper(travelDistance: Float) -> Bool {
+        !isWithinPlanetAtmosphere
+            && !isDocked
+            && !isLanded
+            && travelDistance > 2_500
+    }
+
+    private func autopilotStopDistance(
+        for destination: NearbyNavigationTarget
+    ) -> Float {
+        switch destination.kind {
+        case .station, .wreckage:
+            return 200
+        case .world:
+            if destination.hasAtmosphere {
+                return destination.radius
+                    + UniverseScale.upperAtmosphereDepth(
+                        for: destination.radius
+                    )
+            }
+            return destination.radius + 200
+        }
+    }
+
+    private func estimatedAutopilotFuel(
+        travelDistance: Float,
+        useHyper: Bool
+    ) -> Float {
+        let mult = ProgressionEconomy.fuelCostMultiplier(
+            difficulty: gameDifficulty
+        )
+        guard mult > 0, travelDistance > 1 else { return 0 }
+        if useHyper {
+            let hyperSpeed = max(maximumForwardSpeed, 1) * boostMultiplier
+            let hyperTime = travelDistance / hyperSpeed
+            let approachCruise: Float = 8
+            return (
+                ProgressionEconomy.hyperFuelPerSecond * hyperTime
+                    + ProgressionEconomy.cruiseFuelPerSecond * approachCruise
+            ) * mult
+        }
+        let cruiseSpeed = maximumForwardSpeed * 0.85
+        let cruiseTime = travelDistance / max(cruiseSpeed, 1)
+        return ProgressionEconomy.cruiseFuelPerSecond * cruiseTime * mult
+    }
+
+    private func updateAutopilotAssist(dt: Float) {
+        guard enginesRunning else { return }
+        if autopilotArrivalFlashRemaining > 0 {
+            autopilotArrivalFlashRemaining = max(
+                0,
+                autopilotArrivalFlashRemaining - Double(dt)
+            )
+            autopilotConsoleFlashing =
+                Int(autopilotArrivalFlashRemaining * 5) % 2 == 0
+                && autopilotArrivalFlashRemaining > 0
+            if autopilotArrivalFlashRemaining <= 0 {
+                autopilotConsoleFlashing = false
+            }
+        }
+
+        guard autopilot else { return }
+
+        if autopilotFuelWarningRemaining > 0 {
+            autopilotFuelWarningRemaining = max(
+                0,
+                autopilotFuelWarningRemaining - Double(dt)
+            )
+            autopilotConsoleFlashing =
+                Int(autopilotFuelWarningRemaining * 6) % 2 == 0
+            if autopilotFuelWarningRemaining <= 0, autopilotPendingHyper {
+                beginAutopilotHyperCharge()
+                interactionStatus =
+                    lockedTargetName.map { "Auto-Pilot • hyperspace to \($0)" }
+                    ?? "Auto-Pilot • hyperspace"
+            }
+            return
+        }
+
+        if autopilotHyperChargeRemaining > 0 {
+            autopilotHyperChargeRemaining = max(
+                0,
+                autopilotHyperChargeRemaining - Double(dt)
+            )
+            updateHyperDriveCharge(remaining: autopilotHyperChargeRemaining)
+            if autopilotHyperChargeRemaining <= 0 {
+                activateHyperDrive()
+            }
+            return
+        }
+
+        // Drive toward the destination; leave stick inputs cleared.
+        pitchInput = 0
+        yawInput = 0
+        rollInput = 0
+        if !isBoosting, !isHyperDriveCharging {
+            throttle = max(throttle, 0.85)
+        }
+    }
+
+    var isAutopilotMenuPresented: Bool {
+        switch consolePage {
+        case .autopilot, .autopilotPlanets, .autopilotStations, .autopilotDebris:
+            true
+        default:
+            false
+        }
+    }
+
+    func toggleFabricatorConsole() {
+        if consolePage == .fabricator {
+            consolePage = .standby
+        } else {
+            consolePage = .fabricator
+        }
+    }
+
+    func toggleAutopilotConsole() {
+        if isAutopilotMenuPresented || autopilot {
+            if isAutopilotMenuPresented {
+                consolePage = .standby
+            }
+            if autopilot {
+                disengageAutopilot(keepTarget: true)
+                interactionStatus = "Auto-Pilot off • manual flight"
+            }
+        } else {
+            consolePage = .autopilot
+        }
+    }
+
+    /// Engines on: flight control (and undock / takeoff when secured).
+    /// Engines off in space: hold course and speed, no fuel, hyperdrive stops.
+    func toggleShipEngines() {
+        if consolePage != .engineStart && consolePage != .engineStop {
+            consolePageBeforeEngine = consolePage
+        }
+        if enginesRunning {
+            enginesRunning = false
+            setWeaponTrigger(false)
+            pitchInput = 0
+            yawInput = 0
+            rollInput = 0
+            if isBoosting || isHyperDriveCharging {
+                cancelHyperDriveCharge()
+            }
+            consolePage = .engineStop
+            engineAnimRemaining = 1.6
+            if !isLanded, !isDocked, let world = worldInLowerAtmosphere() {
+                beginPlanetaryLanding(on: world)
+                return
+            }
+            interactionStatus = isDocked || isLanded
+                ? "Engines offline"
+                : "Engines offline • drifting on course"
+            return
+        }
+        enginesRunning = true
+        consolePage = .engineStart
+        engineAnimRemaining = 1.6
+        if isLanded {
+            beginVerticalTakeoff()
+            interactionStatus = "Engines online • taking off"
+        } else if isDocked {
+            isDocked = false
+            securedLocationKind = nil
+            securedLocationName = nil
+            clearDockedStationTradeContext()
+            if isTradeConcourseActive {
+                activeExplorationMode = nil
+                cockpitEntity?.isEnabled = true
+            }
+            interactionStatus = "Engines online • undocked"
+        } else {
+            interactionStatus = "Engines online"
+        }
+    }
+
+    func knownConsoleDestinations(
+        _ kind: NavigationTargetKind
+    ) -> [NearbyNavigationTarget] {
+        universeStreamer?.knownDestinations(
+            kind: kind,
+            near: playerPosition
+        ) ?? []
+    }
+
+    func engageNearestPlanet(kind: CelestialBodyKind? = nil, airless: Bool = false) {
+        guard let target = universeStreamer?.nearestDestination(
+            to: playerPosition,
+            matching: .world,
+            atmosphere: airless ? false : nil,
+            bodyKind: kind,
+            excludingStars: true
+        ) else {
+            interactionStatus = "No matching planet in range"
+            return
+        }
+        engageAutopilot(toward: target)
+    }
+
+    private func worldInLowerAtmosphere() -> NearbyNavigationTarget? {
+        guard let target = universeStreamer?.nearestDestination(
+            to: playerPosition,
+            matching: .world
+        ),
+        target.kind == .world,
+        target.hasAtmosphere else { return nil }
+        let altitude = target.distance - target.radius
+        guard altitude
+            <= UniverseScale.lowerAtmosphereDepth(for: target.radius) else {
+            return nil
+        }
+        return target
+    }
+
+    private func updateEngineAnimation(dt: Float) {
+        guard engineAnimRemaining > 0 else { return }
+        engineAnimRemaining = max(0, engineAnimRemaining - Double(dt))
+        guard engineAnimRemaining == 0 else { return }
+        if consolePage == .engineStart || consolePage == .engineStop {
+            let saved = consolePageBeforeEngine
+            consolePage =
+                saved == .engineStart || saved == .engineStop
+                    ? .standby
+                    : saved
+        }
     }
 
     func performLandingControl() {
@@ -2364,6 +2871,7 @@ final class FlightModel {
         }
         landedShipPosition = playerPosition
         landedShipAttitude = playerAttitude
+        stowHeldHandItem()
         activeExplorationMode = option
         walkingRecoveryUsesRover = false
         cockpitEntity?.isEnabled = false
@@ -2416,6 +2924,7 @@ final class FlightModel {
         explorationTurnInput = 0
         explorationTravelSpeed = 0
         walkingGestureActive = false
+        stowHeldHandItem()
         setSurfaceToolMenuVisible(false)
         setHeldSurfaceToolVisible(false)
         if activeExplorationMode == "Deploy rover" {
@@ -2442,6 +2951,7 @@ final class FlightModel {
         synchronizeTrueForwardParent()
         trueForwardReferenceEntity?.isEnabled = true
         interactionStatus = "Returned to ship"
+        updateWeaponReticleVisual()
         applyCameraTransform()
         universeStreamer?.updateSurfaceDetailVisibility(
             around: playerPosition,
@@ -2520,6 +3030,7 @@ final class FlightModel {
             inventoryVisible = true
             surfaceToolMenuVisible = false
             surfaceToolMenuEntity?.isEnabled = false
+            updateWeaponReticleVisual()
             return
         }
 
@@ -2538,11 +3049,13 @@ final class FlightModel {
         surfaceToolMenuEntity?.isEnabled = showTools
         if showTools {
             surfaceToolStatus =
-                "Kit open • index tap/swipe tools • select inventory items"
+                "Kit open • index tap a tool • select inventory items"
+            syncSurfaceToolMenuSelectionPress()
         }
         if !visible {
             handSurfaceKitActive = false
         }
+        updateWeaponReticleVisual()
     }
 
     func toggleSurfaceKit() {
@@ -2579,6 +3092,7 @@ final class FlightModel {
         heldInventoryItem.isEnabled = false
         updateSelectedSurfaceToolVisual()
         updateHeldInventoryItemVisual()
+        syncSurfaceToolMenuSelectionPress()
     }
 
     func setInventoryVisible(_ visible: Bool) {
@@ -2617,16 +3131,6 @@ final class FlightModel {
         )
     }
 
-    func surfaceToolMenuLocalX(
-        for worldPosition: SIMD3<Float>
-    ) -> Float? {
-        guard surfaceToolMenuVisible,
-              let menu = surfaceToolMenuEntity else {
-            return nil
-        }
-        return menu.convert(position: worldPosition, from: nil).x
-    }
-
     func surfaceToolSlot(
         at worldPosition: SIMD3<Float>
     ) -> Int? {
@@ -2659,10 +3163,37 @@ final class FlightModel {
         selectedSurfaceToolIndex = index
         updateSelectedSurfaceToolVisual()
         updateHeldInventoryItemVisual()
+        syncSurfaceToolMenuSelectionPress()
         surfaceToolStatus =
             selectedSurfaceTool == .empty
                 ? "Tool put away"
                 : "\(selectedSurfaceTool.rawValue) equipped"
+    }
+
+    /// Keep the selected tool plate latched down until another tool is chosen.
+    private func syncSurfaceToolMenuSelectionPress() {
+        pressedSurfaceToolSlotIndex = selectedSurfaceToolIndex
+        updateSurfaceToolMenuPressVisuals()
+    }
+
+    private func updateSurfaceToolMenuPressVisuals() {
+        guard let menu = surfaceToolMenuEntity else { return }
+        let pressDepth: Float = 0.008
+        for child in menu.children where child.name.hasPrefix("Tool Slot ") {
+            let suffix = child.name.dropFirst("Tool Slot ".count)
+            guard let index = Int(suffix.prefix(while: \.isNumber)) else {
+                continue
+            }
+            let pressed = index == pressedSurfaceToolSlotIndex
+            let plateZ: Float = pressed ? -pressDepth : 0
+            let glyphZ: Float = pressed ? 0.009 - pressDepth : 0.009
+            if let plate = child.findEntity(named: "Tool Slot Plate") {
+                plate.position.z = plateZ
+            }
+            if let glyph = child.findEntity(named: "Tool Slot Glyph") {
+                glyph.position.z = glyphZ
+            }
+        }
     }
 
     func cycleSurfaceTool(by offset: Int) {
@@ -2693,19 +3224,73 @@ final class FlightModel {
                 && selectedSurfaceTool != .empty
     }
 
+    /// Last time hand tracking posed the held inventory item (gamepad fallback
+    /// only kicks in when this goes stale).
+    @ObservationIgnored var lastHeldInventoryHandPoseTime: TimeInterval = 0
+
     func updateHeldInventoryItemPose(
         position: SIMD3<Float>,
-        pointingDirection: SIMD3<Float>
+        pointingDirection: SIMD3<Float>,
+        palmNormal: SIMD3<Float> = SIMD3<Float>(0, 1, 0),
+        fromHandTracking: Bool = false
     ) {
         guard let heldInventoryItemEntity else { return }
-        heldInventoryItemEntity.position =
-            position + simd_normalize(pointingDirection) * 0.08
-        heldInventoryItemEntity.orientation = simd_quatf(
-            from: SIMD3<Float>(0, 0, -1),
-            to: simd_normalize(pointingDirection)
+        let forward = simd_normalize(pointingDirection)
+        heldInventoryItemEntity.position = position + forward * 0.08
+        // Full grip basis: fingers = object −Z, palm-out = object +Y so
+        // folding fingers / flipping palm rotates the held prop with the hand.
+        heldInventoryItemEntity.orientation = handGripOrientation(
+            pointingDirection: forward,
+            palmNormal: palmNormal
         )
         heldInventoryItemEntity.isEnabled =
             equippedInventoryItemID != nil
+        if fromHandTracking {
+            lastHeldInventoryHandPoseTime =
+                ProcessInfo.processInfo.systemUptime
+        }
+    }
+
+    /// Maps hand axes onto held props (local −Z along fingers, +Y out of palm).
+    private func handGripOrientation(
+        pointingDirection: SIMD3<Float>,
+        palmNormal: SIMD3<Float>
+    ) -> simd_quatf {
+        let forward = simd_normalize(pointingDirection)
+        var upHint = palmNormal
+        if simd_length_squared(upHint) < 0.000_1 {
+            upHint = SIMD3<Float>(0, 1, 0)
+        } else {
+            upHint = simd_normalize(upHint)
+        }
+        var right = simd_cross(forward, upHint)
+        if simd_length_squared(right) < 0.000_1 {
+            right = simd_cross(forward, SIMD3<Float>(0, 1, 0))
+            if simd_length_squared(right) < 0.000_1 {
+                right = simd_cross(forward, SIMD3<Float>(1, 0, 0))
+            }
+        }
+        right = simd_normalize(right)
+        let up = simd_normalize(simd_cross(right, forward))
+        let basis = simd_float3x3(columns: (right, up, -forward))
+        return simd_normalize(simd_quatf(basis))
+    }
+
+    /// Unequip whatever is in the dominant hand. Used when boarding or leaving.
+    private func stowHeldHandItem() {
+        let holdingItem = equippedInventoryItemID != nil
+        let holdingTool = selectedSurfaceTool != .empty
+        guard holdingItem || holdingTool else { return }
+        stopMatterCrumblerBeam()
+        equippedInventoryItemID = nil
+        persistInventory()
+        selectedSurfaceToolIndex = SurfaceTool.empty.rawIndex
+        updateSelectedSurfaceToolVisual()
+        updateHeldInventoryItemVisual()
+        heldInventoryItemEntity?.isEnabled = false
+        heldSurfaceToolEntity?.isEnabled = false
+        syncSurfaceToolMenuSelectionPress()
+        surfaceToolStatus = holdingItem ? "Item put away" : "Tool put away"
     }
 
     func equipInventoryItem(_ item: InventoryItem) {
@@ -2717,6 +3302,7 @@ final class FlightModel {
         selectedSurfaceToolIndex = 0
         updateSelectedSurfaceToolVisual()
         updateHeldInventoryItemVisual()
+        syncSurfaceToolMenuSelectionPress()
         // Keep the shared kit open so tools and inventory stay available.
         surfaceToolStatus =
             "\(item.displayName) equipped from \(item.sourcePlanetName)"
@@ -3668,17 +4254,28 @@ final class FlightModel {
         let isLog = item?.category == .log
         let isFeces =
             item?.materialName.lowercased().hasSuffix(" feces") == true
+        let isCircuitBoard =
+            item?.category == .electronic
+            && item?.materialName
+                .localizedCaseInsensitiveContains("circuit") == true
         heldInventoryItemEntity.findEntity(
             named: "Held Inventory Log"
         )?.isEnabled = isLog && !isFeces
         heldInventoryItemEntity.findEntity(
+            named: "Held Inventory Circuit Board"
+        )?.isEnabled = isCircuitBoard
+        heldInventoryItemEntity.findEntity(
             named: "Held Inventory Mineral"
-        )?.isEnabled = item != nil && !isLog && !isFeces
+        )?.isEnabled =
+            item != nil && !isLog && !isFeces && !isCircuitBoard
         heldInventoryItemEntity.findEntity(
             named: "Held Inventory Feces"
         )?.isEnabled = isFeces
 
         guard let item else { return }
+        // Keep authored circuit-board materials intact.
+        guard !isCircuitBoard else { return }
+
         let color: UIColor = switch item.category {
         case .electronic, .module, .blueprint:
             .systemGreen
@@ -3699,6 +4296,10 @@ final class FlightModel {
         let isOrganic =
             item.category == .log || item.category == .creatureMaterial
         for child in heldInventoryItemEntity.children {
+            guard child.name != "Held Inventory Circuit Board",
+                  child.name != "Held Inventory Feces" else {
+                continue
+            }
             (child as? ModelEntity)?.model?.materials = [
                 SimpleMaterial(
                     color: color,
@@ -3852,6 +4453,9 @@ final class FlightModel {
         cancelAutopilotTarget()
         isLanded = landed
         isDocked = !landed
+        if landed {
+            enginesRunning = false
+        }
         securedLocationIdentifier = target.identifier
         securedLocationKind = target.kind
         securedLocationName = target.name
@@ -4135,6 +4739,8 @@ final class FlightModel {
             return
         }
         updateCockpitVisuals(dt: dt)
+        updateEngineAnimation(dt: dt)
+        updateAutopilotAssist(dt: dt)
         burnShipFuel(dt: dt)
         updateWeaponEffects(dt: dt)
         updateSurfaceProjectiles(dt: dt)
@@ -4143,6 +4749,7 @@ final class FlightModel {
         if isWithinPlanetAtmosphere
             && (isBoosting || isHyperDriveCharging) {
             cancelHyperDriveCharge()
+            autopilotHyperChargeRemaining = 0
         }
         updateAtmosphericBoost(dt: dt)
 
@@ -4175,7 +4782,21 @@ final class FlightModel {
         }
 
         let targetSpeed = Float(throttle) * maximumForwardSpeed
-        speed += (targetSpeed - speed) * min(dt * 1.8, 1)
+        if enginesRunning {
+            speed += (targetSpeed - speed) * min(dt * 1.8, 1)
+        } else {
+            pitchInput = 0
+            yawInput = 0
+            rollInput = 0
+            if isBoosting || isHyperDriveCharging {
+                cancelHyperDriveCharge()
+            }
+            if let world = worldInLowerAtmosphere() {
+                beginPlanetaryLanding(on: world)
+                updateAutomatedFlight(dt: dt)
+                return
+            }
+        }
 
         var pitch = Float(pitchInput)
         var yaw = Float(yawInput)
@@ -4190,19 +4811,22 @@ final class FlightModel {
             universeStreamer?.nearestDestination(to: playerPosition)
         }
 
-        if autopilot, let destination = autopilotDestination {
-            let arrivalDistance: Float = switch destination.kind {
-            case .world, .station: destination.radius + 80
-            case .wreckage: 45
+        if enginesRunning, autopilot, let destination = autopilotDestination {
+            let arrivalDistance = autopilotStopDistance(for: destination)
+            if lockedTargetIdentifier != nil
+                && destination.distance <= arrivalDistance {
+                if isBoosting || isHyperDriveCharging {
+                    cancelHyperDriveCharge()
+                }
+                beginAutopilotArrivalFlash(
+                    message: "Arrived at \(destination.name)"
+                )
+            } else {
+                let desired = simd_normalize(destination.vector)
+                let localDesired = playerAttitude.inverse.act(desired)
+                yaw = max(-1, min(1, -localDesired.x * 1.8))
+                pitch = max(-1, min(1, localDesired.y * 1.8))
             }
-            if lockedTargetIdentifier != nil && destination.distance <= arrivalDistance {
-                interactionStatus = "Arrived in orbit of \(destination.name)"
-                cancelAutopilotTarget()
-            }
-            let desired = simd_normalize(destination.vector)
-            let localDesired = playerAttitude.inverse.act(desired)
-            yaw = max(-1, min(1, -localDesired.x * 1.8))
-            pitch = max(-1, min(1, localDesired.y * 1.8))
         }
 
         let turnRate: Float = 0.72
@@ -4328,8 +4952,7 @@ final class FlightModel {
                 automatedFlightPhase = .none
                 automatedTargetIdentifier = nil
                 secureShip(to: target, landed: true)
-                interactionStatus =
-                    "Landing 3/3 • Landed — take off or leave ship"
+                interactionStatus = "Landed • EXIT to leave the ship"
                 return
             }
             let descentSpeed = max(4, min(45, remaining * 0.45))
@@ -4845,8 +5468,13 @@ final class FlightModel {
             return
         }
 
-        let altitude = max(0, world.distance - world.radius)
-        altitudeAboveSurface = altitude
+        // Prefer Double-length altitude so far-from-planet status cannot stick
+        // due to Float truncation on the navigation vector.
+        let altitude =
+            universeStreamer?.altitudeAboveSurface(
+                to: playerPosition,
+                world: world
+            ) ?? max(0, world.distance - world.radius)
         nearbyWorldForEnvironment = world
 
         if world.celestialKind == .star {
@@ -4860,6 +5488,7 @@ final class FlightModel {
             )
             let heatZoneDepth = max(world.radius * 0.6, 250)
             if altitude < heatZoneDepth {
+                altitudeAboveSurface = altitude
                 let proximity = 1 - altitude / heatZoneDepth
                 starHeat = min(100, starHeat + dt * (12 + proximity * 55))
                 atmosphereHazeOpacity =
@@ -4869,6 +5498,7 @@ final class FlightModel {
                     destroyShip(in: world.name)
                 }
             } else {
+                altitudeAboveSurface = nil
                 environmentStatus = "SPACE"
                 atmosphereHazeOpacity = 0
                 starHeat = max(0, starHeat - dt * 16)
@@ -4878,7 +5508,11 @@ final class FlightModel {
 
         starHeat = max(0, starHeat - dt * 20)
         guard world.hasAtmosphere else {
-            environmentStatus = altitude <= 10_000 ? "AIRLESS WORLD" : "SPACE"
+            // Near-body label only — not a 10 km pseudo-atmosphere shell.
+            let airlessNearShell = max(world.radius * 0.75, 60)
+            let nearAirless = altitude <= airlessNearShell
+            environmentStatus = nearAirless ? "AIRLESS WORLD" : "SPACE"
+            altitudeAboveSurface = nearAirless ? altitude : nil
             atmosphericSpeedLimit = nil
             atmosphereHazeOpacity = 0
             updateAtmosphereEnvironment(
@@ -4887,9 +5521,8 @@ final class FlightModel {
                 lightStrength: 0,
                 showSky: false
             )
-            surfaceUpDirection = altitude <= 10_000 && world.distance > 0.001
-                ? -simd_normalize(world.vector)
-                : nil
+            surfaceUpDirection = nil
+            isWithinPlanetAtmosphere = false
             return
         }
 
@@ -4899,8 +5532,10 @@ final class FlightModel {
             UniverseScale.lowerAtmosphereDepth(for: world.radius)
         guard altitude < upperAtmosphereDepth else {
             environmentStatus = "SPACE"
+            altitudeAboveSurface = nil
             atmosphericSpeedLimit = nil
             atmosphereHazeOpacity = 0
+            isWithinPlanetAtmosphere = false
             updateAtmosphereEnvironment(
                 for: nil,
                 skyOpacity: 0,
@@ -4911,6 +5546,7 @@ final class FlightModel {
             return
         }
 
+        altitudeAboveSurface = altitude
         if altitude <= lowerAtmosphereDepth {
             isWithinPlanetAtmosphere = true
             let lowerDepth = 1 - altitude / lowerAtmosphereDepth
@@ -5099,9 +5735,11 @@ final class FlightModel {
         previousUp: SIMD3<Float>?,
         traveledDelta: SIMD3<Float>
     ) {
-        guard !dominantHandActive,
+        guard isWithinPlanetAtmosphere,
+              !dominantHandActive,
               let previousUp,
               let world = nearbyWorldForEnvironment,
+              world.hasAtmosphere,
               world.celestialKind != .star,
               world.distance > 0.001,
               simd_length_squared(traveledDelta) > 1e-10
@@ -5135,7 +5773,9 @@ final class FlightModel {
     /// Soft residual bank/pitch cleanup after stick release. Curvature is
     /// already matched to travel; this only eases leftover roll gently.
     private func applyAtmosphericAutoUpright(dt: Float) {
-        guard !dominantHandActive, let surfaceUpDirection else { return }
+        guard isWithinPlanetAtmosphere,
+              !dominantHandActive,
+              let surfaceUpDirection else { return }
 
         let currentUp = simd_normalize(
             playerAttitude.act(SIMD3<Float>(0, 1, 0))
@@ -5245,8 +5885,13 @@ final class FlightModel {
             weaponReticleSuppressed
                 || isRefineryPresented
                 || isStationShopPresented
+                || inventoryVisible
         weaponReticleEntity.isEnabled =
-            !isOutsideShip && !hideForModal
+            !isOutsideShip && !hideForModal && isWeaponArmed
+        guard isWeaponArmed else {
+            lastReticleWeaponIndex = nil
+            return
+        }
         guard lastReticleWeaponIndex != currentWeaponIndex else { return }
 
         let color: UIColor = switch currentWeaponType {
@@ -5490,47 +6135,70 @@ final class FlightModel {
         }
     }
 
+    /// Purple locator beam from an equipped Relic Key toward the nearest Relic.
     private func updateRelicKeyLocator() {
         let holdingKey = equippedInventoryItem?.isRelicKey == true
             && activeExplorationMode == "Leave on foot"
+            && heldInventoryItemEntity?.isEnabled == true
         guard holdingKey,
               let held = heldInventoryItemEntity,
-              let sceneRoot = held.parent,
-              let aim = universeStreamer?.nearestRelicDirection(
+              let aimWorld = universeStreamer?.nearestRelicDirection(
                 from: held.position(relativeTo: nil)
               ) else {
             relicLocatorEntity?.removeFromParent()
             relicLocatorEntity = nil
             return
         }
-        let line: Entity
+
+        let beamLength: Float = 3.0
+        let beam: Entity
         if let existing = relicLocatorEntity {
-            line = existing
+            beam = existing
         } else {
-            var material = UnlitMaterial(
-                color: UIColor.systemPurple.withAlphaComponent(0.85)
+            let root = Entity()
+            root.name = "Relic Key Locator Beam"
+            var glow = UnlitMaterial(
+                color: UIColor.systemPurple.withAlphaComponent(0.55)
             )
-            material.blending = .transparent(opacity: .init(floatLiteral: 0.85))
-            let created = ModelEntity(
-                mesh: .generateCylinder(height: 3.0, radius: 0.008),
-                materials: [material]
+            glow.blending = .transparent(opacity: .init(floatLiteral: 0.55))
+            let outer = ModelEntity(
+                mesh: .generateCylinder(height: beamLength, radius: 0.022),
+                materials: [glow]
             )
-            created.name = "Relic Key Locator Beam"
-            sceneRoot.addChild(created)
-            relicLocatorEntity = created
-            line = created
+            outer.name = "Locator Glow"
+            root.addChild(outer)
+            let core = ModelEntity(
+                mesh: .generateCylinder(height: beamLength, radius: 0.01),
+                materials: [
+                    UnlitMaterial(color: UIColor.systemPurple)
+                ]
+            )
+            core.name = "Locator Core"
+            root.addChild(core)
+            held.addChild(root)
+            relicLocatorEntity = root
+            beam = root
         }
-        let origin = held.position(relativeTo: nil)
-        let direction = aim
-        let tip = origin + direction * 1.5
-        line.position = sceneRoot.convert(position: tip, from: nil)
-        let localAim = simd_normalize(
-            sceneRoot.convert(direction: direction, from: nil)
-        )
-        line.orientation = simd_quatf(
+
+        if beam.parent !== held {
+            held.addChild(beam)
+        }
+
+        // Aim in the held-key's local space so the beam rides with the hand.
+        var localAim = held.convert(direction: aimWorld, from: nil)
+        if simd_length_squared(localAim) < 0.000_1 {
+            localAim = SIMD3<Float>(0, 0, -1)
+        } else {
+            localAim = simd_normalize(localAim)
+        }
+
+        // Cylinder is Y-up and centered; place so it starts at the key tip.
+        let keyTip = SIMD3<Float>(0, 0, -0.14)
+        beam.position = keyTip + localAim * (beamLength * 0.5)
+        beam.orientation = simd_quatf(
             from: SIMD3<Float>(0, 1, 0),
             to: localAim
         )
-        line.isEnabled = true
+        beam.isEnabled = true
     }
 }

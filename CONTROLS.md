@@ -54,20 +54,30 @@
 | B | Full stop |
 | Y or D-pad Up | Toggle inventory kit |
 
-### Cockpit HUD / attachments (in ship)
+### Flight console (three-facet dash, in ship)
+
+Physical wraparound console (center + left/right wings). Caption above each lamp pad. Walking HUD unchanged.
+
+| Panel | Control | Action |
+|---|---|---|
+| Far left | AUTO-PILOT | On/Off. On opens destination choices on the center screen. Off stops autopilot |
+| Far left | FABRICATOR | On/Off. On shows fabricator options on the center screen. Light stays on while open |
+| Inner left | Monitor | Spare display |
+| Center | Readout | Menus for the selected system (autopilot, fabricator, engine start/stop) |
+| Inner right | Weapon + SHIELD | Weapon arm cycle and shield lamp with meter |
+| Far right | ENGINES | On starts engines (undock/takeoff if secured) and plays a short startup on the center screen. Off in the lower atmosphere starts landing. Off elsewhere in space holds course and speed with no fuel use; hyperdrive stops. The lamp is off after landing |
+| Far right | EXIT | Available once landed or docked (on foot, rover, station visits, …) |
+
+**Auto-Pilot travel:** flies directly to the target; stops within **200 m** of stations/wreckage/airless planets, or at **upper atmosphere** for atmos planets; then flashes 3× and turns off. Uses hyper when available for long legs. Fuel below required → cancel + show needed amount. Fuel at least required but under 2× → 3 s warning flash, then hyper countdown if still on. Fuel at least 2× → hyper countdown immediately (no wait).
+
+### Other cockpit HUD / attachments (in ship)
 
 | Control | Action |
 |---|---|
-| Landing / takeoff / dock button | Context landing control (`performLandingControl`) |
-| Weapon button | Cycle Laser → Missile → Slow Beam |
-| Shield button | Toggle ship shield |
-| DETECT ∞ | Open detection picker (requires Nav Module; otherwise shows lock + station hint) |
-| REFINERY | Open refinery / fabricator when docked or landed |
-| LEAVE menu | Exit options raise **up** from the lower bar (Deploy rover, Leave on foot, Visit trade concourse, Visit station shop, … when available) |
-| DETECT picker | Raises **up** from the lower bar (same expansion rule as LEAVE) |
 | Inventory settings (gear) | Expands **down** from the inventory top bar |
 | Target contact panel | CONTINUE toward locked target / CHANGE TRAJECTORY (cancel autopilot) |
 | Context proximity | DOCK / UNDOCK / EXAMINE when in range and slow enough |
+| Outside-ship bar | ENTER SHIP / rover / FABRICATOR (floating bar; not on the dash) |
 
 ### Mission Control window (non-immersive / companion)
 
@@ -140,7 +150,7 @@ Walk direction follows **headset facing** (projected on the surface).
 | Gesture | Action |
 |---|---|
 | Thumb↔middle (open hand, not tool-thumb-fold, in zone) | Jetpack thrust (while fuel remains) |
-| Index tip tap / swipe on tool strip | Select / cycle surface tools when kit open |
+| Index tip tap on tool strip | Select that surface tool (button stays pressed). Lift finger off the strip before tapping another — no slide/swipe cycling |
 | Thumb fold (armed after release) + aim | Activate selected tool (see tools below) |
 | Thumb↔index pinch + drag | Seated view / compass yaw (persistent) |
 | Hold equipped inventory item to mouth ~2 s | Eat equipped item |
@@ -162,7 +172,7 @@ Tool availability depends on difficulty, shop unlocks, and crafting (see [PROGRE
 
 | Gesture / state | Action |
 |---|---|
-| Equip Relic Key in dominant hand | Thin purple locator line (~3 m) toward nearest Relic |
+| Equip Relic Key in dominant hand | Purple locator beam (~3 m) projects from the key toward the nearest Relic |
 | Pickup scanned Relic | Consumes 1 Relic Key (fuses); Relic can be opened |
 
 ### Both hands
@@ -212,6 +222,7 @@ Tool availability depends on difficulty, shop unlocks, and crafting (see [PROGRE
 | Control | Action |
 |---|---|
 | Ship / Walking / Rover dominant hand | Right or Left per mode (persisted) |
+| Show people while playing | **On by default.** Progressive immersion so nearby people can appear (Digital Crown adjusts immersion). Off locks full immersion. System People Awareness must also allow Immersive Apps (visionOS Settings → Awareness & Safety) |
 | Reset game data | Wipe inventory & Mon, return to starting station, pick difficulty |
 | Reset world (keep stuff) • TEST | Relocate + pick difficulty, keep inventory (temporary for testing) |
 | Difficulty on reset | **Creative** — no real damage, all tools, no energy/fuel costs. **Normal** — basic tools, reduced energy/fuel costs. **Survivor** — Axe start, full energy/fuel costs, Nav Module gated |

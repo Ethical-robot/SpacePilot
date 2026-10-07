@@ -16,9 +16,9 @@ enum ProgressionEconomy {
     static let relicSpawnChancePerTile: Float = 0.12
 
     /// Cruise fuel burn per second at full throttle (Survivor).
-    static let cruiseFuelPerSecond: Float = 0.35
-    static let boostFuelPerSecond: Float = 4.5
-    static let hyperFuelPerSecond: Float = 8.0
+    static let cruiseFuelPerSecond: Float = 0.175
+    static let boostFuelPerSecond: Float = 2.25
+    static let hyperFuelPerSecond: Float = 4.0
 
     // Tool energy costs ( Survivor baseline = 1/4 of the original rates ).
     static let analyzerEnergyCost: Float = 1
@@ -111,6 +111,10 @@ enum ProgressionEconomy {
         let energyCapacityBonus: Float?
         /// Required current expansion count before this storage recipe unlocks.
         let requiredStorageExpansions: Int?
+        /// Combustible raw minerals (cinderstone, ember, coal-likes, …).
+        let combustibleMineralCost: Int
+        /// Ship fuel units added when crafted (capped at tank max).
+        let shipFuelAmount: Float?
 
         init(
             id: String,
@@ -119,12 +123,14 @@ enum ProgressionEconomy {
             elements: [String: Int] = [:],
             logCost: Int = 0,
             anyMineralCost: Int = 0,
+            combustibleMineralCost: Int = 0,
             unlocksTool: SurfaceTool? = nil,
             grantsModuleID: String? = nil,
             grantsBlueprintID: String? = nil,
             energyCubeRecharge: Float? = nil,
             energyCapacityBonus: Float? = nil,
-            requiredStorageExpansions: Int? = nil
+            requiredStorageExpansions: Int? = nil,
+            shipFuelAmount: Float? = nil
         ) {
             self.id = id
             self.title = title
@@ -132,13 +138,26 @@ enum ProgressionEconomy {
             self.elements = elements
             self.logCost = logCost
             self.anyMineralCost = anyMineralCost
+            self.combustibleMineralCost = combustibleMineralCost
             self.unlocksTool = unlocksTool
             self.grantsModuleID = grantsModuleID
             self.grantsBlueprintID = grantsBlueprintID
             self.energyCubeRecharge = energyCubeRecharge
             self.energyCapacityBonus = energyCapacityBonus
             self.requiredStorageExpansions = requiredStorageExpansions
+            self.shipFuelAmount = shipFuelAmount
         }
+    }
+
+    /// Raw minerals that can be burned into ship fuel.
+    static func isCombustibleMineral(materialName: String) -> Bool {
+        let lower = materialName.lowercased()
+        let keys = [
+            "cinder", "ember", "coal", "carbon", "peat", "bitumen",
+            "pitch", "shale", "sulfur", "sulphur", "tar", "graphite",
+            "char", "lignite", "oil", "fuel"
+        ]
+        return keys.contains { lower.contains($0) }
     }
 
     static let craftRecipes: [CraftRecipe] = [
@@ -186,6 +205,26 @@ enum ProgressionEconomy {
             grantsModuleID: roverRefineryModuleID
         ),
         // Energy cubes — single-use full/partial recharges.
+        // Ship fuel — each feedstock works on its own (or mixed for more).
+        CraftRecipe(
+            id: "craft.ship_fuel.logs",
+            title: "Ship Fuel (logs)",
+            logCost: 8,
+            shipFuelAmount: 25
+        ),
+        CraftRecipe(
+            id: "craft.ship_fuel.minerals",
+            title: "Ship Fuel (combustibles)",
+            combustibleMineralCost: 8,
+            shipFuelAmount: 25
+        ),
+        CraftRecipe(
+            id: "craft.ship_fuel.blend",
+            title: "Ship Fuel (mixed)",
+            logCost: 5,
+            combustibleMineralCost: 5,
+            shipFuelAmount: 45
+        ),
         CraftRecipe(
             id: "craft.energy_cube.1",
             title: "Energy Cube I (100)",

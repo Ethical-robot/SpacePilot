@@ -35,8 +35,9 @@ final class HandFlightController {
     private var lastExplorationMode: String?
     private var leftPose: HandPose?
     private var rightPose: HandPose?
+    /// True while the index tip remains on the tool strip after a selection.
+    /// Cleared only when the tip leaves, so sliding cannot change tools.
     private var toolMenuTouchActive = false
-    private var toolMenuTouchStartX: Float?
     private var collectionGestureActive = false
     private var collectionGestureArmed = false
     private var activationGestureEngaged = false
@@ -111,7 +112,6 @@ final class HandFlightController {
         leftPose = nil
         rightPose = nil
         toolMenuTouchActive = false
-        toolMenuTouchStartX = nil
         collectionGestureActive = false
         collectionGestureArmed = false
         resetActivationGesture()
@@ -193,7 +193,9 @@ final class HandFlightController {
             flight?.setDominantHandActive(true)
             flight?.updateHeldInventoryItemPose(
                 position: pose.fistPosition,
-                pointingDirection: pose.wristToKnuckles
+                pointingDirection: pose.gripForward,
+                palmNormal: pose.palmNormal,
+                fromHandTracking: true
             )
             processEatingGesture(pose, now: now)
             processActivationGesture(now: now)
@@ -202,6 +204,7 @@ final class HandFlightController {
         if flight?.activeExplorationMode == "Leave on foot" {
             if anchor.chirality == dominantHand {
                 flight?.setMatterCrumblerTrackingHold(false)
+                // Tools keep the original aim-only pose (not inventory palm grip).
                 flight?.updateHeldSurfaceToolPose(
                     position: pose.fistPosition,
                     pointingDirection: pose.wristToKnuckles
@@ -484,30 +487,19 @@ final class HandFlightController {
               let dominantPose,
               dominantPose.indexExtended else {
             toolMenuTouchActive = false
-            toolMenuTouchStartX = nil
             return
         }
         guard let slot = flight.surfaceToolSlot(
             at: dominantPose.indexTip
-        ), let localX = flight.surfaceToolMenuLocalX(
-            for: dominantPose.indexTip
         ) else {
+            // Tip left the strip — next press can select a different tool.
             toolMenuTouchActive = false
-            toolMenuTouchStartX = nil
             return
         }
-        if !toolMenuTouchActive {
-            toolMenuTouchActive = true
-            toolMenuTouchStartX = localX
-            flight.selectSurfaceTool(at: slot)
-            return
-        }
-        guard let startX = toolMenuTouchStartX else { return }
-        let swipe = localX - startX
-        if abs(swipe) >= 0.048 {
-            flight.cycleSurfaceTool(by: swipe > 0 ? 1 : -1)
-            toolMenuTouchStartX = localX
-        }
+        // One selection per press; ignore slides across neighboring slots.
+        guard !toolMenuTouchActive else { return }
+        toolMenuTouchActive = true
+        flight.selectSurfaceTool(at: slot)
     }
 
     private func processCollectionGesture() {
@@ -908,14 +900,40 @@ final class HandFlightController {
             return
         }
 
+        if !flight.enginesRunning {
+            flight.rollInput = 0
+            flight.yawInput = 0
+            flight.pitchInput = 0
+            updateLaserTrigger(
+                thumbFoldRatio: pose.thumbFoldRatio,
+                thumbIsUp: pose.thumbIsUp
+            )
+            flight.setDominantHandActive(true)
+            updateStatus()
+            return
+        }
+
+        // Auto-Pilot owns attitude while engaged — ignore stick.
+        if flight.autopilot {
+            flight.rollInput = 0
+            flight.yawInput = 0
+            flight.pitchInput = 0
+            updateLaserTrigger(
+                thumbFoldRatio: pose.thumbFoldRatio,
+                thumbIsUp: pose.thumbIsUp
+            )
+            flight.setDominantHandActive(true)
+            flight.dominantHandName =
+                flight.dominantHandSettingForCurrentMode.rawValue
+            updateStatus()
+            return
+        }
+
         flight.rollInput = smoothed(flight.rollInput, toward: -lateral * 0.78)
         flight.yawInput = smoothed(flight.yawInput, toward: -lateral)
         flight.pitchInput = smoothed(flight.pitchInput, toward: pitch)
         updateLaserTrigger(thumbFoldRatio: pose.thumbFoldRatio, thumbIsUp: pose.thumbIsUp)
 
-        if !flight.hasAutopilotTarget {
-            flight.autopilot = false
-        }
         flight.setDominantHandActive(true)
         flight.dominantHandName =
             flight.dominantHandSettingForCurrentMode.rawValue
@@ -938,6 +956,23 @@ final class HandFlightController {
 
     private func applyThrottle(_ pose: HandPose) {
         guard let flight else { return }
+        if !flight.enginesRunning {
+            if flight.isBoosting || flight.isHyperDriveCharging {
+                flight.cancelHyperDriveCharge()
+            }
+            flight.setSupportHandActive(true)
+            updateStatus()
+            return
+        }
+        if flight.autopilot {
+            // AP owns throttle / hyper; still allow canceling hyper with thumb up.
+            if flight.isBoosting, pose.thumbFoldRatio > 1.03 {
+                flight.cancelHyperDriveCharge()
+            }
+            flight.setSupportHandActive(true)
+            updateStatus()
+            return
+        }
         if throttleNeutralPosition == nil {
             throttleNeutralPosition = pose.fistPosition
             throttleNeutralValue = flight.throttle
@@ -1072,7 +1107,6 @@ final class HandFlightController {
         runGestureLatched = false
         lastKitPoseMatchTime = 0
         toolMenuTouchActive = false
-        toolMenuTouchStartX = nil
         collectionGestureActive = false
         collectionGestureArmed = false
         endSeatedViewYawPinch()
@@ -1297,6 +1331,11 @@ final class HandFlightController {
         let indexTip = fingerTipPositions[0]
 
         let knuckleCenter = (indexKnuckle + middleKnuckle + ringKnuckle + littleKnuckle) / 4
+        let tipCenter =
+            (fingerTipPositions[0]
+                + fingerTipPositions[1]
+                + fingerTipPositions[2]
+                + fingerTipPositions[3]) / 4
         let fistPosition = (wrist + knuckleCenter) / 2
 
         // Treat the little-finger side as the fixed base of a vertical joystick
@@ -1333,6 +1372,13 @@ final class HandFlightController {
             anchor.chirality == .right ? uncorrectedAcrossPalm : -uncorrectedAcrossPalm
         )
         let wristToKnuckles = simd_normalize(knuckleCenter - wrist)
+        // Grip forward follows fingertips so curling / folding fingers pitches
+        // held props; fall back to knuckle axis when tips collapse into the fist.
+        let tipAxis = tipCenter - wrist
+        let gripForward: SIMD3<Float> =
+            simd_length_squared(tipAxis) > 0.000_4
+                ? simd_normalize(tipAxis)
+                : wristToKnuckles
         let backOfHandNormal = simd_normalize(simd_cross(palmRight, wristToKnuckles))
         let palmNormal = -backOfHandNormal
         let knucklesAreUp = backOfHandNormal.y > 0.48
@@ -1373,6 +1419,7 @@ final class HandFlightController {
             indexTip: indexTip,
             palmNormal: palmNormal,
             wristToKnuckles: wristToKnuckles,
+            gripForward: gripForward,
             frame: frame,
             thumbIsUp: thumbIsUp,
             thumbRaisedForWalking: thumbRaisedForWalking,
@@ -1427,6 +1474,8 @@ private struct HandPose {
     let indexTip: SIMD3<Float>
     let palmNormal: SIMD3<Float>
     let wristToKnuckles: SIMD3<Float>
+    /// Finger-tip axis for held props (pitches when fingers fold).
+    let gripForward: SIMD3<Float>
     let frame: FistFrame
     let thumbIsUp: Bool
     let thumbRaisedForWalking: Bool

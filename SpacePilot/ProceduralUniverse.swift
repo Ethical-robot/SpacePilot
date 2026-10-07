@@ -782,6 +782,10 @@ private final class UniverseDiscoveryStore {
         defaults.set(data, forKey: Self.storageKey)
     }
 
+    func discoveredPointIdentifiers() -> [String] {
+        Array(snapshot.discoveredPointsOfInterest ?? [])
+    }
+
     func isWreckageInvestigated(_ identifier: String) -> Bool {
         snapshot.investigatedWreckage?.contains(identifier) == true
     }
@@ -1337,13 +1341,15 @@ final class UniverseStreamer {
             state.shipMarker.isEnabled = false
         }
 
-        if let roverPosition {
+        if let roverPosition, !roverIsOccupied {
+            // Parked visual + collider only. While occupied, the player *is*
+            // the rover — never place the marker on them or it self-blocks.
             positionSurfaceMarker(
                 state.roverMarker,
                 at: roverPosition,
                 state: state
             )
-            state.roverMarker.isEnabled = !roverIsOccupied
+            state.roverMarker.isEnabled = true
         } else {
             state.roverMarker.isEnabled = false
         }
@@ -2381,6 +2387,7 @@ final class UniverseStreamer {
         )
     }
 
+    /// World-space direction from `origin` to the nearest Relic formation.
     func nearestRelicDirection(
         from origin: SIMD3<Float>
     ) -> SIMD3<Float>? {
@@ -2388,12 +2395,11 @@ final class UniverseStreamer {
         var best: Entity?
         var bestDistance = Float.greatestFiniteMagnitude
         func inspect(_ entity: Entity) {
+            guard entity.isEnabled else { return }
             if entity.name.hasPrefix("Collectible Mineral|"),
                mineralIsRelic(encodedIn: entity.name) {
-                let distance = simd_distance(
-                    entity.position(relativeTo: nil),
-                    origin
-                )
+                let position = entity.position(relativeTo: nil)
+                let distance = simd_distance(position, origin)
                 if distance < bestDistance {
                     best = entity
                     bestDistance = distance
@@ -2582,27 +2588,7 @@ final class UniverseStreamer {
 
         let droppedCircuitBoard = Int.random(in: 0..<100) < 40
         if droppedCircuitBoard {
-            let board = ModelEntity(
-                mesh: .generateBox(
-                    width: 0.34,
-                    height: 0.035,
-                    depth: 0.22
-                ),
-                materials: [
-                    SimpleMaterial(
-                        color: UIColor(
-                            red: 0.04,
-                            green: 0.38,
-                            blue: 0.18,
-                            alpha: 1
-                        ),
-                        roughness: 0.35,
-                        isMetallic: true
-                    )
-                ]
-            )
-            board.name = "Loose Electronic|Circuit Board"
-            board.position.y = 0.025
+            let board = SpaceSceneBuilder.makeCircuitBoardPickup()
             wreckage.addChild(board)
         }
         surfaceExplorationState = state
@@ -2643,42 +2629,31 @@ final class UniverseStreamer {
             ]
         )
         drop.name = "Loose Creature Material|\(materialName)"
+        // Stay on the ray through the corpse. Rebuilding a landing point
+        // from tangent dots sent the drop back toward the spawn.
         let defeatedPosition = creature.position(relativeTo: state.root)
-        let deathX = simd_dot(defeatedPosition, state.tangentRight)
-        let deathZ = simd_dot(defeatedPosition, state.tangentForward)
-        let surfaceUp = projectedSurfaceDirection(
-            x: deathX,
-            z: deathZ,
-            state: state
-        )
-        let landingPosition =
-            surfaceUp
-            * (state.effectiveRadius + expandedBiomeElevation + 0.18)
-        let deathAltitude = max(
+        let length = simd_length(defeatedPosition)
+        let surfaceUp = length > 0.001
+            ? defeatedPosition / length
+            : state.anchorNormal
+        let groundRadius =
+            state.effectiveRadius + expandedBiomeElevation
+        let landingPosition = surfaceUp * (groundRadius + 0.18)
+        let altitude = max(
             0,
-            simd_dot(defeatedPosition, surfaceUp)
-                - (state.effectiveRadius + expandedBiomeElevation)
+            simd_dot(defeatedPosition, surfaceUp) - groundRadius
         )
-        let releasePosition =
-            deathAltitude > 0.35
-                ? defeatedPosition
-                : defeatedPosition
-                    + surfaceUp * (2.6 * max(0.7, creature.scale.y))
         drop.orientation = simd_quatf(
             angle: Float(hash % 628) / 100,
             axis: surfaceUp
         )
-        let fallDistance = simd_distance(
-            releasePosition,
-            landingPosition
-        )
-        drop.position = releasePosition
+        drop.position = altitude > 0.35 ? defeatedPosition : landingPosition
         state.root.addChild(drop)
-        if fallDistance > 0.25 {
+        if altitude > 0.35 {
             var landingTransform = drop.transform
             landingTransform.translation = landingPosition
             let fallDuration = Double(
-                min(2.4, max(0.45, sqrt(fallDistance) * 0.42))
+                min(2.4, max(0.45, sqrt(altitude) * 0.42))
             )
             drop.move(
                 to: landingTransform,
@@ -3173,15 +3148,41 @@ final class UniverseStreamer {
         }
     }
 
+    /// Surface altitude using Double range math (avoids Float truncation when
+    /// the ship is far from the body but still shares a loaded sector).
+    func altitudeAboveSurface(
+        to position: GalacticPosition,
+        world: NearbyNavigationTarget
+    ) -> Float {
+        guard world.kind == .world,
+              let ref = destinationRefs[world.identifier],
+              let region = loadedRegions[ref.sector],
+              case .body(let bodyIndex) = ref.target,
+              region.descriptor.bodies.indices.contains(bodyIndex)
+        else {
+            return max(0, world.distance - world.radius)
+        }
+        let body = region.descriptor.bodies[bodyIndex]
+        let vector = position.vector(
+            to: ref.sector,
+            local: body.localPosition
+        )
+        return Float(max(0, simd_length(vector) - Double(body.radius)))
+    }
+
     func nearestDestination(
         to position: GalacticPosition,
         matching requestedKind: NavigationTargetKind? = nil,
-        atmosphere requiredAtmosphere: Bool? = nil
+        atmosphere requiredAtmosphere: Bool? = nil,
+        bodyKind: CelestialBodyKind? = nil,
+        excludingStars: Bool = false
     ) -> NearbyNavigationTarget? {
         var nearest: NearbyNavigationTarget?
         for region in loadedRegions.values {
             if requestedKind == nil || requestedKind == .world {
                 for (bodyIndex, body) in region.descriptor.bodies.enumerated() {
+                    if excludingStars, body.kind == .star { continue }
+                    if let bodyKind, body.kind != bodyKind { continue }
                     if let requiredAtmosphere {
                         guard body.kind != .star,
                               body.hasAtmosphere == requiredAtmosphere else {
@@ -3238,6 +3239,19 @@ final class UniverseStreamer {
             }
         }
         return nearest
+    }
+
+    /// Previously discovered stations or wreckage, closest first.
+    /// Only targets in loaded space resolve to a distance.
+    func knownDestinations(
+        kind: NavigationTargetKind,
+        near position: GalacticPosition
+    ) -> [NearbyNavigationTarget] {
+        discoveries.discoveredPointIdentifiers().compactMap {
+            destination(identifiedBy: $0, to: position)
+        }
+        .filter { $0.kind == kind }
+        .sorted { $0.distance < $1.distance }
     }
 
     func destination(
@@ -3563,6 +3577,11 @@ final class UniverseStreamer {
         var stepHeight: Float = 0
 
         func inspect(_ entity: Entity) {
+            // Disabled markers (e.g. occupied "Parked Rover") stay in the
+            // hierarchy but must not collide — otherwise the driving rover
+            // blocks itself.
+            guard entity.isEnabled else { return }
+
             let collisionRadius: Float?
             let collisionHeight: Float
             let isStepable: Bool
@@ -3602,12 +3621,13 @@ final class UniverseStreamer {
                 collisionHeight = 0.82
                 isStepable = false
             } else if entity.name == "Landed Ship" {
-                collisionRadius = 2.5
-                collisionHeight = 1.1
+                let scale = SpaceSceneBuilder.interceptorShipVisualScale
+                collisionRadius = 3.2 * scale
+                collisionHeight = 1.15 * scale
                 isStepable = false
             } else if entity.name == "Parked Rover" {
-                collisionRadius = 1.35
-                collisionHeight = 0.65
+                collisionRadius = 2.4
+                collisionHeight = 0.95
                 isStepable = false
             } else {
                 collisionRadius = nil
@@ -4163,88 +4183,11 @@ final class UniverseStreamer {
     }
 
     private func makeSurfaceShipMarker() -> Entity {
-        let ship = Entity()
-        ship.name = "Landed Ship"
-        let hullMaterial = SimpleMaterial(
-            color: UIColor(white: 0.72, alpha: 1),
-            roughness: 0.26,
-            isMetallic: true
-        )
-        let windowMaterial = UnlitMaterial(
-            color: UIColor.systemCyan.withAlphaComponent(0.92)
-        )
-        let hull = ModelEntity(
-            mesh: .generateBox(
-                width: 3.2,
-                height: 1.25,
-                depth: 6.4,
-                cornerRadius: 0.45
-            ),
-            materials: [hullMaterial]
-        )
-        hull.position.y = 1.05
-        ship.addChild(hull)
-        let canopy = ModelEntity(
-            mesh: .generateSphere(radius: 1.15),
-            materials: [windowMaterial]
-        )
-        canopy.position = [0, 1.85, -0.65]
-        canopy.scale = [1, 0.55, 1.35]
-        ship.addChild(canopy)
-        for side: Float in [-1, 1] {
-            let wing = ModelEntity(
-                mesh: .generateBox(
-                    width: 2.8,
-                    height: 0.22,
-                    depth: 3.5
-                ),
-                materials: [hullMaterial]
-            )
-            wing.position = [side * 2.25, 0.72, 0.35]
-            ship.addChild(wing)
-        }
-        return ship
+        SpaceSceneBuilder.makeInterceptorShip(name: "Landed Ship")
     }
 
     private func makeSurfaceRoverMarker() -> Entity {
-        let rover = Entity()
-        rover.name = "Parked Rover"
-        let bodyMaterial = SimpleMaterial(
-            color: UIColor(red: 0.62, green: 0.32, blue: 0.08, alpha: 1),
-            roughness: 0.48,
-            isMetallic: true
-        )
-        let tireMaterial = SimpleMaterial(
-            color: UIColor(white: 0.06, alpha: 1),
-            roughness: 0.92,
-            isMetallic: false
-        )
-        let body = ModelEntity(
-            mesh: .generateBox(
-                width: 2.1,
-                height: 0.8,
-                depth: 3.4,
-                cornerRadius: 0.28
-            ),
-            materials: [bodyMaterial]
-        )
-        body.position.y = 0.95
-        rover.addChild(body)
-        for side: Float in [-1, 1] {
-            for depth: Float in [-1.05, 1.05] {
-                let wheel = ModelEntity(
-                    mesh: .generateCylinder(height: 0.34, radius: 0.48),
-                    materials: [tireMaterial]
-                )
-                wheel.position = [side * 1.15, 0.48, depth]
-                wheel.orientation = simd_quatf(
-                    angle: .pi / 2,
-                    axis: [0, 0, 1]
-                )
-                rover.addChild(wheel)
-            }
-        }
-        return rover
+        SpaceSceneBuilder.makeSurfaceRover(name: "Parked Rover")
     }
 
     private func projectedSurfaceDirection(
@@ -4338,10 +4281,11 @@ final class UniverseStreamer {
             return (0.72, 1.64)
         }
         if entity.name == "Landed Ship" {
-            return (2.5, 2.2)
+            let scale = SpaceSceneBuilder.interceptorShipVisualScale
+            return (3.2 * scale, 2.35 * scale)
         }
         if entity.name == "Parked Rover" {
-            return (1.35, 1.3)
+            return (2.4, 1.9)
         }
         return nil
     }
