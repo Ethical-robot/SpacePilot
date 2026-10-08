@@ -5,23 +5,39 @@ import simd
 /// See `SCALE_AND_SPEED_CONTRACT.md`.
 enum ScaleAndSpeedContract {
     // MARK: - Atmosphere gameplay envelope (from surface)
+    //
+    // Absolute distances, same units the ship already flies. Planet radii are
+    // only a few hundred units, so a fraction of R was too thin to fly.
+    // The visual limb stays a thin shell and does not use these depths.
 
-    /// Lower-atmosphere thickness as a fraction of planet radius.
-    static let lowerAtmosphereFraction: Float = 0.52
-    /// Additional upper-atmosphere thickness as a fraction of planet radius.
-    static let upperAtmosphereAdditionalFraction: Float = 0.42
-    /// Total atmo stack from surface (`lower + upper additional`).
-    static var totalAtmosphereFraction: Float {
-        lowerAtmosphereFraction + upperAtmosphereAdditionalFraction
+    /// Distant haze shells. Inside this, the plain core shows until the
+    /// relief mesh takes over. Not a speed zone.
+    static let biomeViewDistance: Float = 20_000
+
+    /// One relief mesh of the whole planet, coarse until the lower atmosphere.
+    static let reliefViewDistance: Float = 10_000
+
+    /// Upper atmosphere, in planet radii above the surface.
+    /// Entry should happen when the world is large in view. A fixed 12,000
+    /// started the full-screen sky while a radius-320 world was still a
+    /// small disc, and the Earth station sits only ~1,800 units outside it.
+    static let upperAtmosphereRadiusMultiple: Float = 2.8
+    static let upperAtmosphereMinimum: Float = 420
+    /// Lower band, where landing and the ground bubble live.
+    static let lowerAtmosphereRadiusMultiple: Float = 0.95
+    static let lowerAtmosphereMinimum: Float = 180
+
+    static func upperAtmosphereDepth(for radius: Float) -> Float {
+        max(radius * upperAtmosphereRadiusMultiple, upperAtmosphereMinimum)
     }
 
     static func lowerAtmosphereDepth(for radius: Float) -> Float {
-        radius * lowerAtmosphereFraction
-    }
-
-    /// Distance from surface to the top of the upper atmosphere.
-    static func upperAtmosphereDepth(for radius: Float) -> Float {
-        radius * totalAtmosphereFraction
+        let upper = upperAtmosphereDepth(for: radius)
+        let lower = max(
+            radius * lowerAtmosphereRadiusMultiple,
+            lowerAtmosphereMinimum
+        )
+        return min(lower, upper * 0.62)
     }
 
     // MARK: - Visual atmosphere limb
@@ -35,8 +51,9 @@ enum ScaleAndSpeedContract {
     static let atmosphericBaseMax: Float = 24
 
     static let lowerAtmosphereBoostMultiplier: Float = 1.75
-    static let upperAtmosphereCruiseMultiplier: Float = 3.5
-    static let upperAtmosphereBoostMultiplier: Float = 7.0
+    /// Upper cruise is 5× the lower cruise ceiling.
+    static let upperAtmosphereCruiseMultiplier: Float = 5
+    static let upperAtmosphereBoostMultiplier: Float = 10
     static let systemCruiseMultiplier: Float = 32
     /// Hyperdrive max relative to system cruise.
     static let hyperdriveVsSystemMultiplier: Float = 20

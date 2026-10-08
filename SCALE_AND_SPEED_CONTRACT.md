@@ -77,14 +77,16 @@ Distances = `time × systemCruiseMax`.
 Soft alpha; stars show through the rim. **Never** use gameplay envelope thickness for the glow mesh.
 
 ### Gameplay envelope (from surface)
-| Band | Thickness |
-|---|---|
-| Lower atmosphere | `0.52 × R` |
-| Upper atmosphere (additional) | `0.42 × R` |
-| **Total stack** | `0.94 × R` |
 
-`upperAtmosphereDepth(R)` = total from surface = `0.94 × R`  
-`lowerAtmosphereDepth(R)` = `0.52 × R`
+Scaled to the planet so you enter when the world is large in view. A fixed 12,000-unit shell started the full-screen sky while the planet was still a small disc (the Earth station sits only about 1,800 units outside that shell). The visual limb above does **not** use these depths.
+
+| Band | Distance from surface |
+|---|---|
+| Lower atmosphere | `max(0.95 × R, 180)`, and at most 62% of the upper depth |
+| Upper atmosphere | `max(2.8 × R, 420)` |
+| Biome view (globe + rings only, not a speed zone) | within `20,000` |
+
+Earth (`R ≈ 320`): lower about 300, upper about 900. Autopilot stops at the upper edge.
 
 Airless worlds: no atmo bands; near-surface approach shell for landing only.
 
@@ -103,8 +105,8 @@ Let **`A = atmosphericBaseMax = 24`** (lower-atmo non-boost ceiling / dogfight-r
 |---|---|---|
 | Lower atmo cruise | `1.0 × A` | 24 |
 | Lower atmo speed button | `1.75 × A` | 42 |
-| Upper atmo cruise | `3.5 × A` | 84 |
-| Upper atmo + speed button | `7.0 × A` | 168 |
+| Upper atmo cruise | `5.0 × A` | 120 |
+| Upper atmo + speed button | `10 × A` | 240 |
 | System cruise | `32 × A` | 768 |
 | Hyperdrive | `20 × system` | 15_360 |
 

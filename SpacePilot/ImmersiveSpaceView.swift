@@ -500,6 +500,22 @@ private struct SurfaceInventoryView: View {
                 .foregroundStyle(.secondary)
             }
 
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle(isOn: Binding(
+                    get: { flight.unlimitedFuelAndEnergy },
+                    set: { flight.setUnlimitedFuelAndEnergy($0) }
+                )) {
+                    Text("Unlimited fuel and energy")
+                        .font(.headline)
+                }
+                Text(
+                    "Temporary testing switch. Ship fuel and tool energy"
+                        + " are not spent while this is on."
+                )
+                .font(.caption2)
+                .foregroundStyle(.orange.opacity(0.9))
+            }
+
             if let prompt = flight.settingsResetPrompt {
                 resetDifficultyChooser(prompt)
             } else {

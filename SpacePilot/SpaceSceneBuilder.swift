@@ -12,11 +12,16 @@ enum SpaceSceneBuilder {
     @MainActor
     private static var circuitBoardTemplate: Entity?
 
+    /// Cached VXR-7 Phantom hull used for the landed player ship.
+    @MainActor
+    private static var phantomShipTemplate: Entity?
+
     @MainActor
     static func makeScene() -> Entity {
         let root = Entity()
         root.name = "Universe"
         preloadCircuitBoardTemplate()
+        preloadPhantomShipTemplate()
         return root
     }
 
@@ -35,6 +40,23 @@ enum SpaceSceneBuilder {
             return
         }
         circuitBoardTemplate = try? Entity.load(contentsOf: url)
+    }
+
+    /// Loads `Resources/Ship/VXR7_Phantom.usdz` once for cloning.
+    @MainActor
+    static func preloadPhantomShipTemplate() {
+        guard phantomShipTemplate == nil else { return }
+        guard let url = Bundle.main.url(
+            forResource: "VXR7_Phantom",
+            withExtension: "usdz",
+            subdirectory: "Resources/Ship"
+        ) ?? Bundle.main.url(
+            forResource: "VXR7_Phantom",
+            withExtension: "usdz"
+        ) else {
+            return
+        }
+        phantomShipTemplate = try? Entity.load(contentsOf: url)
     }
 
     /// Salvage circuit board (robot wreckage / held prop). Uses authored USDZ when available.
@@ -118,7 +140,7 @@ enum SpaceSceneBuilder {
         environment.isEnabled = false
 
         let sky = ModelEntity(
-            mesh: .generateSphere(radius: 260),
+            mesh: Self.makeSkyDomeMesh(radius: 1, lowerElevation: -0.2),
             materials: [
                 UnlitMaterial(
                     color: UIColor.systemBlue.withAlphaComponent(0)
@@ -126,9 +148,6 @@ enum SpaceSceneBuilder {
             ]
         )
         sky.name = "Atmosphere Sky"
-        // Render the sphere from inside so it surrounds the player instead of
-        // appearing as a flat HUD panel.
-        sky.scale.x = -1
         environment.addChild(sky)
 
         let lightDirections: [SIMD3<Float>] = [
@@ -151,6 +170,128 @@ enum SpaceSceneBuilder {
             environment.addChild(light)
         }
         return environment
+    }
+
+    /// Sky from just past the planet's limb up to the zenith. +Z (texture
+    /// u = 0) is the sun's compass direction. +Y is the zenith. The open
+    /// side is only the planet, so the shell is not a haze painted on a
+    /// world seen from space.
+    @MainActor
+    static func makeSkyDomeMesh(
+        radius: Float,
+        lowerElevation: Float
+    ) -> MeshResource {
+        let latSteps = 36
+        let lonSteps = 72
+        let lower = max(-.pi / 2 + 0.04, min(lowerElevation, 1.2))
+        let columns = lonSteps + 1
+        var positions: [SIMD3<Float>] = []
+        var normals: [SIMD3<Float>] = []
+        var uvs: [SIMD2<Float>] = []
+        var indices: [UInt32] = []
+        positions.reserveCapacity((latSteps + 1) * columns)
+        for lat in 0...latSteps {
+            let rise = Float(lat) / Float(latSteps)
+            let elevation = lower + (.pi / 2 - lower) * rise
+            let ring = cos(elevation) * radius
+            let y = sin(elevation) * radius
+            for lon in 0...lonSteps {
+                let turn = Float(lon) / Float(lonSteps)
+                let theta = turn * 2 * .pi
+                let position = SIMD3<Float>(
+                    sin(theta) * ring,
+                    y,
+                    cos(theta) * ring
+                )
+                positions.append(position)
+                normals.append(simd_normalize(position))
+                uvs.append(SIMD2(turn, rise))
+            }
+        }
+        func index(lat: Int, lon: Int) -> UInt32 {
+            UInt32(lat * columns + lon)
+        }
+        for lat in 0..<latSteps {
+            for lon in 0..<lonSteps {
+                let a = index(lat: lat, lon: lon)
+                let b = index(lat: lat, lon: lon + 1)
+                let c = index(lat: lat + 1, lon: lon)
+                let d = index(lat: lat + 1, lon: lon + 1)
+                // Both sides, so the shell is visible from inside the dome.
+                indices.append(contentsOf: [
+                    a, c, b, b, c, d,
+                    a, b, c, b, d, c
+                ])
+            }
+        }
+        var descriptor = MeshDescriptor(name: "Sky Dome")
+        descriptor.positions = MeshBuffers.Positions(positions)
+        descriptor.normals = MeshBuffers.Normals(normals)
+        descriptor.textureCoordinates = MeshBuffers.TextureCoordinates(uvs)
+        descriptor.primitives = .triangles(indices)
+        return (try? MeshResource.generate(from: [descriptor]))
+            ?? .generateSphere(radius: radius)
+    }
+
+    /// Day sky, with a sunrise or sunset only while the sun is on the horizon.
+    /// u = 0 faces the sun. v = 0 is the limb and v = 1 is the zenith.
+    @MainActor
+    static func makeAtmosphereSkyTexture(
+        daylight: Float,
+        sunset: Float
+    ) -> TextureResource? {
+        let width = 192
+        let height = 96
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
+                | CGImageAlphaInfo.premultipliedLast.rawValue
+        ),
+        let bytes = context.data
+        else { return nil }
+
+        let pixels = bytes.bindMemory(to: UInt8.self, capacity: width * height * 4)
+        let day = max(0, min(1, daylight))
+        let glow = max(0, min(1, sunset))
+        let zenithDay = SIMD3<Float>(0.38, 0.64, 1)
+        let horizonDay = SIMD3<Float>(0.70, 0.84, 1)
+        let zenithDusk = SIMD3<Float>(0.08, 0.12, 0.28)
+        let sunsetRed = SIMD3<Float>(1, 0.34, 0.10)
+        let skyLift = max(day, glow * 0.4)
+        let zenith = zenithDusk + (zenithDay - zenithDusk) * skyLift
+        let horizon = horizonDay
+
+        for y in 0..<height {
+            // Texture v = 0 is the bottom of the image. The limb uses v = 0.
+            let v = 1 - Float(y) / Float(height - 1)
+            let up = v * v * (3 - 2 * v)
+            let aboveHorizon = pow(max(0, 1 - v), 1.7)
+            for x in 0..<width {
+                let u = Float(x) / Float(width - 1)
+                let fromSun = min(u, 1 - u) * 2
+                let towardSun = exp(-fromSun * fromSun * 7.5)
+                var color = horizon + (zenith - horizon) * up
+                let red = glow * aboveHorizon * towardSun
+                color = color + (sunsetRed - color) * red
+                let alpha: Float = 1
+                let offset = (y * width + x) * 4
+                pixels[offset] = UInt8(max(0, min(255, color.x * alpha * 255)))
+                pixels[offset + 1] = UInt8(max(0, min(255, color.y * alpha * 255)))
+                pixels[offset + 2] = UInt8(max(0, min(255, color.z * alpha * 255)))
+                pixels[offset + 3] = UInt8(max(0, min(255, alpha * 255)))
+            }
+        }
+        guard let baked = context.makeImage() else { return nil }
+        return try? TextureResource(
+            image: baked,
+            options: .init(semantic: .color)
+        )
     }
 
     @MainActor
@@ -1101,13 +1242,30 @@ enum SpaceSceneBuilder {
         }
     }
 
-    // MARK: - Player ship exterior (chrome delta interceptor)
+    // MARK: - Player ship exterior
 
-    /// Brushed-silver twin-engine delta interceptor matching the reference look
-    /// (panel seams, reflective chrome, dark canopy, ribbed idle nozzles).
-    /// Local space: +Y up, −Z forward (nose), +Z aft (engines).
+    /// Landed player ship. Uses the VXR-7 Phantom when the USDZ is in the
+    /// app bundle. Local space: +Y up, −Z forward (nose), gear on Y = 0.
+    /// The 1.5 scale keeps the 18 m model about the same size as the
+    /// previous exterior.
     @MainActor
     static func makeInterceptorShip(
+        name: String = "Landed Ship"
+    ) -> Entity {
+        preloadPhantomShipTemplate()
+        if let template = phantomShipTemplate {
+            let ship = template.clone(recursive: true)
+            ship.name = name
+            ship.scale = SIMD3<Float>(repeating: 1.5)
+            return ship
+        }
+        return makeProceduralInterceptorShip(name: name)
+    }
+
+    /// Brushed-silver stand-in used only if the Phantom model fails to load.
+    /// Local space: +Y up, −Z forward (nose), +Z aft (engines).
+    @MainActor
+    private static func makeProceduralInterceptorShip(
         name: String = "Landed Ship"
     ) -> Entity {
         let ship = Entity()

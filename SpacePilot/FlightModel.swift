@@ -76,6 +76,8 @@ private struct PlayerSettingsSnapshot: Codable {
     var difficulty: String
     /// Prefer seeing people / surroundings while immersed. Missing = on.
     var showPeopleWhilePlaying: Bool?
+    /// Testing switch. Missing = off.
+    var unlimitedFuelAndEnergy: Bool?
 }
 
 enum FlightConsolePage: Equatable, Sendable {
@@ -315,6 +317,9 @@ final class FlightModel {
     @ObservationIgnored var atmosphericBoostBlend: Float = 0
     var isAtmosphericBoostActive = false
     var isWithinPlanetAtmosphere = false
+    /// Close enough to an airless surface to level and land. No sky haze.
+    @ObservationIgnored var isInAirlessLandingRange = false
+    @ObservationIgnored var shipLaserDamageTimer: Float = 0
     var isDocked = false
     var isLanded = false
     var contextActionTitle: String?
@@ -329,6 +334,8 @@ final class FlightModel {
     var environmentStatus = "SPACE"
     var altitudeAboveSurface: Float?
     var atmosphericSpeedLimit: Float?
+    /// Boost ceiling while inside an atmosphere. Independent of space boost.
+    var atmosphericBoostLimit: Float?
     @ObservationIgnored var atmosphereHazeOpacity = 0.0
     var starHeat: Float = 0
     var isShipDestroyed = false
@@ -372,6 +379,8 @@ final class FlightModel {
     /// Progressive immersion so People Awareness / Crown can reveal people.
     /// Off locks full immersion. Default on.
     var showPeopleWhilePlaying = true
+    /// Temporary testing switch. Ship fuel and tool energy are not spent.
+    var unlimitedFuelAndEnergy = false
     /// Confirmation sheet inside settings (`nil` = none).
     var settingsResetPrompt: SettingsResetPrompt?
     /// Tools available for the current difficulty / unlocks.
@@ -426,6 +435,8 @@ final class FlightModel {
     @ObservationIgnored var atmosphereLightEntities: [DirectionalLight] = []
     @ObservationIgnored var lastAtmosphereVisualOpacity: Float = -1
     @ObservationIgnored var lastAtmosphereVisualKind: CelestialBodyKind?
+    @ObservationIgnored var lastSkyLimbElevation: Float = 999
+    @ObservationIgnored var lastSkyTextureKey: Int = -1
     @ObservationIgnored var playerPosition = GalacticPosition.origin
     @ObservationIgnored var playerAttitude = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
     @ObservationIgnored var lastTick = ContinuousClock.now
@@ -588,9 +599,11 @@ final class FlightModel {
             min(atmosphericSpeedLimit, unrestrictedSpeed)
         )
         guard atmosphericBoostBlend > 0 else { return limitedSpeed }
+        let boostCeiling =
+            atmosphericBoostLimit
+            ?? maximumForwardSpeed * atmosphericBoostMultiplier
         return limitedSpeed
-            + (maximumForwardSpeed * atmosphericBoostMultiplier - limitedSpeed)
-                * atmosphericBoostBlend
+            + (boostCeiling - limitedSpeed) * atmosphericBoostBlend
     }
     var isConsumingHyperFuel: Bool { isBoosting }
     /// `currentWeaponIndex == equippedWeapons.count` means disarmed.
@@ -716,7 +729,9 @@ final class FlightModel {
             target.distance <= UniverseScale.stationDockingDistance
         case .wreckage: target.distance <= 50
         case .world:
-            target.hasAtmosphere
+            target.celestialKind == .gas
+                ? false
+                : target.hasAtmosphere
                 ? target.distance - target.radius
                     <= UniverseScale.lowerAtmosphereDepth(for: target.radius)
                 : target.distance <= target.radius + 22
@@ -795,10 +810,13 @@ final class FlightModel {
         environmentStatus = "SPACE"
         altitudeAboveSurface = nil
         atmosphericSpeedLimit = nil
+            atmosphericBoostLimit = nil
         atmosphereHazeOpacity = 0
         atmosphereEnvironmentEntity?.isEnabled = false
         lastAtmosphereVisualOpacity = -1
         lastAtmosphereVisualKind = nil
+        lastSkyLimbElevation = 999
+        lastSkyTextureKey = -1
         surfaceUpDirection = nil
         nearbyWorldForEnvironment = nil
         starHeat = 0
@@ -1000,6 +1018,11 @@ final class FlightModel {
         persistPlayerSettings()
     }
 
+    func setUnlimitedFuelAndEnergy(_ enabled: Bool) {
+        unlimitedFuelAndEnergy = enabled
+        persistPlayerSettings()
+    }
+
     func beginSettingsResetPrompt(_ prompt: SettingsResetPrompt) {
         settingsResetPrompt = prompt
     }
@@ -1148,6 +1171,7 @@ final class FlightModel {
             roverDominantHand = .right
             gameDifficulty = .normal
             showPeopleWhilePlaying = true
+            unlimitedFuelAndEnergy = false
             dominantHandName = DominantHandSetting.right.rawValue
             return
         }
@@ -1161,6 +1185,7 @@ final class FlightModel {
         gameDifficulty =
             GameDifficulty(rawValue: snapshot.difficulty) ?? .normal
         showPeopleWhilePlaying = snapshot.showPeopleWhilePlaying ?? true
+        unlimitedFuelAndEnergy = snapshot.unlimitedFuelAndEnergy ?? false
         dominantHandName = dominantHandSettingForCurrentMode.rawValue
     }
 
@@ -1172,7 +1197,8 @@ final class FlightModel {
             walkingDominantHand: walkingDominantHand.rawValue,
             roverDominantHand: roverDominantHand.rawValue,
             difficulty: gameDifficulty.rawValue,
-            showPeopleWhilePlaying: showPeopleWhilePlaying
+            showPeopleWhilePlaying: showPeopleWhilePlaying,
+            unlimitedFuelAndEnergy: unlimitedFuelAndEnergy
         )
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         defaults.set(data, forKey: Self.settingsStorageKey)
@@ -1277,6 +1303,7 @@ final class FlightModel {
 
     @discardableResult
     func spendOrganicEnergy(_ amount: Float) -> Bool {
+        if unlimitedFuelAndEnergy { return true }
         let cost =
             amount * ProgressionEconomy.energyCostMultiplier(
                 difficulty: gameDifficulty
@@ -1350,6 +1377,7 @@ final class FlightModel {
     }
 
     private func burnShipFuel(dt: Float) {
+        if unlimitedFuelAndEnergy { return }
         let mult = ProgressionEconomy.fuelCostMultiplier(
             difficulty: gameDifficulty
         )
@@ -2179,6 +2207,8 @@ final class FlightModel {
         atmosphereLightEntities = []
         lastAtmosphereVisualOpacity = -1
         lastAtmosphereVisualKind = nil
+        lastSkyLimbElevation = 999
+        lastSkyTextureKey = -1
     }
 
     func grabJoystick(at fistPosition: SIMD3<Float>) {
@@ -2340,6 +2370,31 @@ final class FlightModel {
     }
 
     private func updateWeaponEffects(dt: Float) {
+        if isTriggerPressed,
+           currentWeaponType == .laser,
+           !isOutsideShip,
+           !isLanded {
+            shipLaserDamageTimer -= dt
+            if shipLaserDamageTimer <= 0 {
+                let origin =
+                    aimAnchorEntity?.position(relativeTo: nil) ?? .zero
+                let aim = aimAnchorEntity?.convert(
+                    direction: SIMD3<Float>(0, 0, -1),
+                    to: nil
+                ) ?? SIMD3<Float>(0, 0, -1)
+                if let result = universeStreamer?.damageCreatureAlongRay(
+                    from: origin,
+                    direction: aim,
+                    damage: 80
+                ) {
+                    interactionStatus = result
+                    shipLaserDamageTimer = 0.4
+                }
+            }
+        } else {
+            shipLaserDamageTimer = 0
+        }
+
         if isMissileInFlight {
             missileFlightRemaining -= dt
             missileEntity?.position += missileVisualVelocity * dt
@@ -2462,9 +2517,9 @@ final class FlightModel {
             0.0001,
             ProgressionEconomy.fuelCostMultiplier(difficulty: gameDifficulty)
         )
-        // Creative (0 cost) always has enough fuel.
+        // Creative (0 cost) and the testing toggle always have enough fuel.
         let effectiveRequired =
-            fuelMult <= 0.0001 ? 0 : requiredFuel
+            unlimitedFuelAndEnergy || fuelMult <= 0.0001 ? 0 : requiredFuel
 
         if shipFuel + 0.05 < effectiveRequired {
             autopilot = false
@@ -2684,7 +2739,7 @@ final class FlightModel {
             }
             consolePage = .engineStop
             engineAnimRemaining = 1.6
-            if !isLanded, !isDocked, let world = worldInLowerAtmosphere() {
+            if !isLanded, !isDocked, let world = worldInLandingEnvelope() {
                 beginPlanetaryLanding(on: world)
                 return
             }
@@ -2737,13 +2792,16 @@ final class FlightModel {
         engageAutopilot(toward: target)
     }
 
-    private func worldInLowerAtmosphere() -> NearbyNavigationTarget? {
+    /// Lower atmosphere on a world with air, or the same distance above an
+    /// airless surface. Airless worlds use the range to land, not to haze.
+    private func worldInLandingEnvelope() -> NearbyNavigationTarget? {
         guard let target = universeStreamer?.nearestDestination(
             to: playerPosition,
             matching: .world
         ),
         target.kind == .world,
-        target.hasAtmosphere else { return nil }
+        target.celestialKind != .gas,
+        target.celestialKind != .star else { return nil }
         let altitude = target.distance - target.radius
         guard altitude
             <= UniverseScale.lowerAtmosphereDepth(for: target.radius) else {
@@ -2801,21 +2859,27 @@ final class FlightModel {
         case .wreckage where target.distance <= 50:
             secureShip(to: target, landed: false)
             interactionStatus = "Secured to \(target.name)"
+        case .world where target.celestialKind == .gas:
+            interactionStatus = "Gas world — no surface to land on"
         case .world
-            where target.hasAtmosphere
+            where target.celestialKind != .star
                 && target.distance - target.radius
                     <= UniverseScale.lowerAtmosphereDepth(for: target.radius):
             beginPlanetaryLanding(on: target)
-        case .world where target.distance <= target.radius + 22:
-            beginPlanetaryLanding(on: target)
-        case .world:
+        case .world where target.hasAtmosphere:
             interactionStatus = "Enter the lower atmosphere before landing"
+        case .world:
+            interactionStatus = "Move closer to the surface before landing"
         default:
             interactionStatus = "Move closer to the docking target"
         }
     }
 
     private func beginPlanetaryLanding(on target: NearbyNavigationTarget) {
+        if target.celestialKind == .gas {
+            interactionStatus = "Gas world — no surface to land on"
+            return
+        }
         setWeaponTrigger(false)
         cancelAutopilotTarget()
         cancelHyperDriveCharge()
@@ -2839,6 +2903,8 @@ final class FlightModel {
             isLanded = false
             securedLocationKind = nil
             securedLocationName = nil
+            surfaceShipPosition = nil
+            updateSurfaceVehicleMarkers()
             interactionStatus = "Takeoff complete"
             return
         }
@@ -2850,8 +2916,12 @@ final class FlightModel {
         activeExplorationMode = nil
         resetWalkingLocomotionBoosts()
         isLanded = false
+        surfaceShipPosition = nil
+        updateSurfaceVehicleMarkers()
         automatedTargetIdentifier = world.identifier
-        takeoffTargetDistance = world.distance + 30.48
+        let surfaceRadius =
+            universeStreamer?.shipSurfaceRadius(for: world) ?? world.radius
+        takeoffTargetDistance = max(world.distance, surfaceRadius) + 30.48
         automatedFlightPhase = .verticalTakeoff
         interactionStatus = "Takeoff • Vertical climb 100 ft"
     }
@@ -2881,31 +2951,42 @@ final class FlightModel {
         interactionStatus = option
         if isSurfaceExploration {
             initializeExplorationHeading()
-            if let surfaceAdjustment =
+            let alreadyOnSurface =
+                universeStreamer?.hasProximitySurface(
+                    around: playerPosition
+                ) ?? false
+            if !alreadyOnSurface,
+               let surfaceAdjustment =
                 universeStreamer?.beginSurfaceExploration(
                     around: playerPosition
                 ) {
                 playerPosition.translate(
                     by: SIMD3<Double>(surfaceAdjustment)
                 )
-                universeStreamer?.update(
-                    around: playerPosition.sector
-                )
-                universeStreamer?.updateSurfaceExploration(
-                    around: playerPosition
-                )
-                surfaceShipPosition = playerPosition
-                moveAcrossSurface(
-                    by: explorationHeading
-                        * (option == "Deploy rover" ? 8 : 5)
-                )
-                if option == "Deploy rover" {
-                    isRoverDeployed = true
-                    surfaceRoverPosition = playerPosition
-                }
-                updateSurfaceNavigation()
-                updateSurfaceVehicleMarkers()
             }
+            universeStreamer?.update(
+                around: playerPosition.sector
+            )
+            surfaceShipPosition = playerPosition
+            if let projected = universeStreamer?.reprojectOntoSurfaceShell(
+                playerPosition
+            ) {
+                playerPosition = projected
+            }
+            universeStreamer?.updateSurfaceExploration(
+                around: playerPosition,
+                engagePlayer: true
+            )
+            moveAcrossSurface(
+                by: explorationHeading
+                    * (option == "Deploy rover" ? 8 : 5)
+            )
+            if option == "Deploy rover" {
+                isRoverDeployed = true
+                surfaceRoverPosition = playerPosition
+            }
+            updateSurfaceNavigation()
+            updateSurfaceVehicleMarkers()
         }
         universeStreamer?.updateSurfaceDetailVisibility(
             around: playerPosition,
@@ -2933,7 +3014,6 @@ final class FlightModel {
         }
         activeExplorationMode = nil
         resetWalkingLocomotionBoosts()
-        universeStreamer?.endSurfaceExploration()
         if let shipPosition = landedShipPosition {
             playerPosition = shipPosition
         }
@@ -2943,6 +3023,7 @@ final class FlightModel {
         landedShipPosition = nil
         landedShipAttitude = nil
         surfaceShipPosition = nil
+        updateSurfaceVehicleMarkers()
         shipNavigationDistance = 0
         shipNavigationBearingDegrees = 0
         roverNavigationDistance = nil
@@ -4455,6 +4536,9 @@ final class FlightModel {
         isDocked = !landed
         if landed {
             enginesRunning = false
+            // The cockpit is the ship. The exterior hull appears only after exit.
+            surfaceShipPosition = nil
+            updateSurfaceVehicleMarkers()
         }
         securedLocationIdentifier = target.identifier
         securedLocationKind = target.kind
@@ -4704,6 +4788,99 @@ final class FlightModel {
         }
     }
 
+    private func applyCrustCarry(dt: Float) {
+        guard let motion = universeStreamer?.updateCelestialMotion(
+            around: playerPosition,
+            deltaTime: dt
+        ) else { return }
+        playerPosition = motion.carried(playerPosition)
+        playerAttitude = simd_normalize(motion.rotation * playerAttitude)
+        if let ship = landedShipPosition {
+            landedShipPosition = motion.carried(ship)
+        }
+        if let attitude = landedShipAttitude {
+            landedShipAttitude = simd_normalize(motion.rotation * attitude)
+        }
+        if let ship = surfaceShipPosition {
+            surfaceShipPosition = motion.carried(ship)
+        }
+        if let rover = surfaceRoverPosition {
+            surfaceRoverPosition = motion.carried(rover)
+        }
+        if isSurfaceExploration {
+            explorationHeading = simd_normalize(
+                motion.rotation.act(explorationHeading)
+            )
+            explorationNorth = simd_normalize(
+                motion.rotation.act(explorationNorth)
+            )
+            explorationEast = simd_normalize(
+                motion.rotation.act(explorationEast)
+            )
+        }
+        // The spin multiply is exact only while attitude stays a pure
+        // rotation. After many day and night turns a small pitch error
+        // stacks up, so a grounded view is rebuilt level to the ground
+        // with the current heading kept.
+        if isLanded || isSurfaceExploration {
+            levelGroundedHorizon()
+        }
+        // Landed and docked frames return before the flight loop refreshes
+        // the camera. Without this, the crust turns in the view while the
+        // cockpit stays on the previous spot.
+        applyCameraTransform()
+    }
+
+    /// Keeps a landed or on-foot view level with the ground underfoot.
+    private func levelGroundedHorizon() {
+        guard let world = universeStreamer?.nearestDestination(
+            to: playerPosition,
+            matching: .world
+        ), world.distance > 0.001 else { return }
+        let up = simd_normalize(-world.vector)
+        playerAttitude = attitude(playerAttitude, levelTo: up)
+        if isLanded, let ship = landedShipAttitude {
+            landedShipAttitude = attitude(ship, levelTo: up)
+        }
+        guard isSurfaceExploration else { return }
+        explorationHeading = flattened(explorationHeading, up: up)
+        explorationNorth = flattened(explorationNorth, up: up)
+        let east = simd_cross(up, explorationNorth)
+        guard simd_length_squared(east) > 1e-8 else { return }
+        explorationEast = simd_normalize(east)
+        explorationNorth = simd_normalize(
+            simd_cross(explorationEast, up)
+        )
+    }
+
+    private func attitude(
+        _ attitude: simd_quatf,
+        levelTo up: SIMD3<Float>
+    ) -> simd_quatf {
+        var forward = attitude.act(SIMD3<Float>(0, 0, -1))
+        forward -= up * simd_dot(forward, up)
+        guard simd_length_squared(forward) > 1e-8 else { return attitude }
+        forward = simd_normalize(forward)
+        let right = simd_normalize(simd_cross(forward, up))
+        let basis = simd_float3x3(columns: (right, up, -forward))
+        return simd_normalize(simd_quatf(basis))
+    }
+
+    private func flattened(
+        _ direction: SIMD3<Float>,
+        up: SIMD3<Float>
+    ) -> SIMD3<Float> {
+        let tangent = direction - up * simd_dot(direction, up)
+        guard simd_length_squared(tangent) > 1e-8 else { return direction }
+        return simd_normalize(tangent)
+    }
+
+    private func daylightFactor() -> Float {
+        let elevation =
+            universeStreamer?.sunElevation(around: playerPosition) ?? 1
+        return max(0, min(1, (elevation + 0.08) / 0.35))
+    }
+
     func tick(deltaTime externalDelta: Float? = nil) {
         onFrameExtras?()
         let dt: Float
@@ -4738,6 +4915,7 @@ final class FlightModel {
             updateRelicKeyLocator()
             return
         }
+        applyCrustCarry(dt: dt)
         updateCockpitVisuals(dt: dt)
         updateEngineAnimation(dt: dt)
         updateAutopilotAssist(dt: dt)
@@ -4791,7 +4969,7 @@ final class FlightModel {
             if isBoosting || isHyperDriveCharging {
                 cancelHyperDriveCharge()
             }
-            if let world = worldInLowerAtmosphere() {
+            if let world = worldInLandingEnvelope() {
                 beginPlanetaryLanding(on: world)
                 updateAutomatedFlight(dt: dt)
                 return
@@ -4946,7 +5124,9 @@ final class FlightModel {
             }
 
         case .descendingForLanding:
-            let landingDistance = target.radius + 2
+            let landingDistance =
+                universeStreamer?.shipSurfaceRadius(for: target)
+                ?? target.radius + PlanetSurfaceField.shipSurfaceClearance
             let remaining = max(0, target.distance - landingDistance)
             if remaining <= 0.05 {
                 automatedFlightPhase = .none
@@ -5265,8 +5445,14 @@ final class FlightModel {
             )
         }
         let vectorAfterMove = world.vector - safeDelta
+        let outward = simd_length_squared(vectorAfterMove) > 0.000_001
+            ? -simd_normalize(vectorAfterMove)
+            : -simd_normalize(world.vector)
         let localTerrainElevation =
-            universeStreamer?.surfaceElevation(around: playerPosition) ?? 0
+            universeStreamer?.surfaceElevation(
+                around: playerPosition,
+                worldOutward: outward
+            ) ?? 0
         let surfaceDistance =
             (universeStreamer?.activeSurfaceRadius ?? world.radius)
                 + UniverseScale.surfaceEyeHeight
@@ -5291,12 +5477,17 @@ final class FlightModel {
         let slowFallSpeed: Float = 1.6
         let gravity: Float = 6.5
 
-        if isJetpackThrusting, surfaceJetpackFuel > 0 {
-            let burn = min(deltaTime, surfaceJetpackFuel)
-            surfaceJetpackFuel -= burn
+        if isJetpackThrusting,
+           unlimitedFuelAndEnergy || surfaceJetpackFuel > 0 {
+            let burn = unlimitedFuelAndEnergy
+                ? deltaTime
+                : min(deltaTime, surfaceJetpackFuel)
+            if !unlimitedFuelAndEnergy {
+                surfaceJetpackFuel -= burn
+            }
             surfaceJetpackVelocity = riseSpeed
             surfaceJetpackAltitude += riseSpeed * burn
-            if surfaceJetpackFuel <= 0 {
+            if !unlimitedFuelAndEnergy, surfaceJetpackFuel <= 0 {
                 isJetpackThrusting = false
             }
         } else if surfaceJetpackAltitude > 0 {
@@ -5418,6 +5609,7 @@ final class FlightModel {
 
     private func updateFlightEnvironment(dt: Float) {
         isWithinPlanetAtmosphere = false
+        isInAirlessLandingRange = false
         if isLanded || isDocked {
             let securedWorld = universeStreamer?.nearestDestination(
                 to: playerPosition,
@@ -5432,16 +5624,16 @@ final class FlightModel {
                         ? "LANDED • ATMOSPHERE"
                         : "LANDED • AIRLESS")
             atmosphericSpeedLimit = 0
-            atmosphereHazeOpacity =
-                isLanded && securedWorld?.hasAtmosphere == true ? 0.12 : 0
-            updateAtmosphereEnvironment(
-                for: isLanded ? securedWorld : nil,
-                skyOpacity: isLanded && securedWorld?.hasAtmosphere == true
-                    ? 0.12 : 0,
-                lightStrength: isLanded && securedWorld?.hasAtmosphere == true
-                    ? 1 : 0,
-                showSky: isLanded
-            )
+            atmosphericBoostLimit = 0
+            refreshViewerSky(near: isLanded ? securedWorld : nil)
+            if isLanded, let securedWorld, securedWorld.kind == .world {
+                universeStreamer?.maintainProximitySurface(
+                    around: playerPosition,
+                    deltaTime: dt,
+                    simulateLife: true,
+                    allowRebase: false
+                )
+            }
             surfaceUpDirection = nil
             nearbyWorldForEnvironment = isLanded ? securedWorld : nil
             starHeat = max(0, starHeat - dt * 20)
@@ -5455,6 +5647,7 @@ final class FlightModel {
             environmentStatus = "SPACE"
             altitudeAboveSurface = nil
             atmosphericSpeedLimit = nil
+            atmosphericBoostLimit = nil
             atmosphereHazeOpacity = 0
             updateAtmosphereEnvironment(
                 for: nil,
@@ -5464,6 +5657,9 @@ final class FlightModel {
             )
             surfaceUpDirection = nil
             nearbyWorldForEnvironment = nil
+            if !isSurfaceExploration {
+                universeStreamer?.endSurfaceExploration()
+            }
             starHeat = max(0, starHeat - dt * 20)
             return
         }
@@ -5479,6 +5675,7 @@ final class FlightModel {
 
         if world.celestialKind == .star {
             atmosphericSpeedLimit = nil
+            atmosphericBoostLimit = nil
             surfaceUpDirection = nil
             updateAtmosphereEnvironment(
                 for: nil,
@@ -5503,6 +5700,9 @@ final class FlightModel {
                 atmosphereHazeOpacity = 0
                 starHeat = max(0, starHeat - dt * 16)
             }
+            if !isSurfaceExploration {
+                universeStreamer?.endSurfaceExploration()
+            }
             return
         }
 
@@ -5514,6 +5714,7 @@ final class FlightModel {
             environmentStatus = nearAirless ? "AIRLESS WORLD" : "SPACE"
             altitudeAboveSurface = nearAirless ? altitude : nil
             atmosphericSpeedLimit = nil
+            atmosphericBoostLimit = nil
             atmosphereHazeOpacity = 0
             updateAtmosphereEnvironment(
                 for: nil,
@@ -5523,6 +5724,31 @@ final class FlightModel {
             )
             surfaceUpDirection = nil
             isWithinPlanetAtmosphere = false
+            let landingRange =
+                UniverseScale.lowerAtmosphereDepth(for: world.radius)
+            isInAirlessLandingRange = altitude <= landingRange
+            if isInAirlessLandingRange, world.distance > 0.001 {
+                surfaceUpDirection = -simd_normalize(world.vector)
+            }
+            environmentStatus = isInAirlessLandingRange
+                ? "AIRLESS • LANDING RANGE"
+                : (nearAirless ? "AIRLESS WORLD" : "SPACE")
+            let upper = UniverseScale.upperAtmosphereDepth(for: world.radius)
+            if !isSurfaceExploration {
+                if altitude <= upper {
+                    universeStreamer?.maintainProximitySurface(
+                        around: playerPosition,
+                        deltaTime: dt,
+                        simulateLife: altitude
+                            <= UniverseScale.lowerAtmosphereDepth(
+                                for: world.radius
+                            ),
+                        allowRebase: !isLanded
+                    )
+                } else {
+                    universeStreamer?.endSurfaceExploration()
+                }
+            }
             return
         }
 
@@ -5534,6 +5760,7 @@ final class FlightModel {
             environmentStatus = "SPACE"
             altitudeAboveSurface = nil
             atmosphericSpeedLimit = nil
+            atmosphericBoostLimit = nil
             atmosphereHazeOpacity = 0
             isWithinPlanetAtmosphere = false
             updateAtmosphereEnvironment(
@@ -5543,6 +5770,9 @@ final class FlightModel {
                 showSky: false
             )
             surfaceUpDirection = nil
+            if !isSurfaceExploration {
+                universeStreamer?.endSurfaceExploration()
+            }
             return
         }
 
@@ -5550,50 +5780,124 @@ final class FlightModel {
         if altitude <= lowerAtmosphereDepth {
             isWithinPlanetAtmosphere = true
             let lowerDepth = 1 - altitude / lowerAtmosphereDepth
-            let dogfightLimit = maximumForwardSpeed * 0.5
-            let surfaceLimit = maximumForwardSpeed * 0.175
+            let cruiseCeiling = ScaleAndSpeedContract.lowerAtmosphereCruiseMax
+            let surfaceLimit = cruiseCeiling * 0.35
             atmosphericSpeedLimit =
-                dogfightLimit + (surfaceLimit - dogfightLimit) * lowerDepth
-            // Lower atmosphere stays visually clear so surface landmarks,
-            // ships, and terrain remain easy to read while flying.
-            let skyOpacity = 0.045 + (1 - lowerDepth) * 0.055
-            atmosphereHazeOpacity = Double(skyOpacity)
-            updateAtmosphereEnvironment(
-                for: world,
-                skyOpacity: skyOpacity,
-                lightStrength: 0.88 + lowerDepth * 0.12,
-                showSky: true
-            )
+                cruiseCeiling + (surfaceLimit - cruiseCeiling) * lowerDepth
+            atmosphericBoostLimit =
+                ScaleAndSpeedContract.lowerAtmosphereBoostMax
             environmentStatus = "LOW ATMOSPHERE"
+            refreshViewerSky(near: world)
+            if !isSurfaceExploration {
+                universeStreamer?.maintainProximitySurface(
+                    around: playerPosition,
+                    deltaTime: dt,
+                    simulateLife: true,
+                    allowRebase: !isLanded
+                )
+            }
         } else {
             isWithinPlanetAtmosphere = true
-            let upperProgress =
-                (upperAtmosphereDepth - altitude)
-                / (upperAtmosphereDepth - lowerAtmosphereDepth)
-            // Upper-atmosphere flight is exactly twice the lower-atmosphere
-            // entry limit, while still preventing hyperdrive near a planet.
-            atmosphericSpeedLimit = maximumForwardSpeed
-            // Foggy veil that still lets the pilot read continents below.
-            let skyOpacity = 0.14 + upperProgress * 0.20
-            atmosphereHazeOpacity = Double(skyOpacity)
-            updateAtmosphereEnvironment(
-                for: world,
-                skyOpacity: skyOpacity,
-                lightStrength: 0.32 + upperProgress * 0.34,
-                showSky: true
-            )
+            // Upper cruise is 5× the lower cruise ceiling. Hyperdrive stays
+            // blocked for the whole atmosphere stack.
+            atmosphericSpeedLimit =
+                ScaleAndSpeedContract.upperAtmosphereCruiseMax
+            atmosphericBoostLimit =
+                ScaleAndSpeedContract.upperAtmosphereBoostMax
             environmentStatus = "UPPER ATMOSPHERE"
+            refreshViewerSky(near: world)
+            if !isSurfaceExploration {
+                universeStreamer?.endSurfaceExploration()
+            }
         }
         surfaceUpDirection = world.distance > 0.001
             ? -simd_normalize(world.vector)
             : SIMD3<Float>(0, 1, 0)
     }
 
+    /// Brightens the whole sky around the viewer, from the planet limb to
+    /// the zenith, while the sun is up inside an atmosphere. The shell stays
+    /// on the camera and turns off in space.
+    private func refreshViewerSky(near world: NearbyNavigationTarget?) {
+        let sky = universeStreamer?.atmosphericSky(around: playerPosition)
+            ?? (presence: Float(0), daylight: Float(0))
+        let sunElevation =
+            universeStreamer?.sunElevation(around: playerPosition) ?? 0
+        let sunset = horizonGlow(forSunElevation: sunElevation)
+        let inAtmosphere =
+            world?.hasAtmosphere == true && sky.presence > 0.02
+        let coverage = max(sky.daylight, sunset * 0.92)
+        let skyOpacity = inAtmosphere ? coverage * sky.presence * 0.9 : 0
+        atmosphereHazeOpacity = Double(skyOpacity)
+        updateAtmosphereEnvironment(
+            for: inAtmosphere ? world : nil,
+            skyOpacity: skyOpacity,
+            lightStrength: inAtmosphere
+                ? sky.presence * (0.15 + 0.75 * sky.daylight)
+                : 0,
+            showSky: skyOpacity > 0.02,
+            daylight: sky.daylight,
+            sunset: sunset
+        )
+    }
+
+    /// 1 while the sun is crossing the horizon, 0 once it is clearly up or down.
+    private func horizonGlow(forSunElevation elevation: Float) -> Float {
+        let risen = smoothstep(0.02, 0.20, elevation)
+        let stillUp = smoothstep(-0.16, -0.02, elevation)
+        return (1 - risen) * stillUp
+    }
+
+    private func smoothstep(
+        _ edge0: Float,
+        _ edge1: Float,
+        _ value: Float
+    ) -> Float {
+        let span = edge1 - edge0
+        guard abs(span) > 0.0001 else { return value >= edge1 ? 1 : 0 }
+        let t = max(0, min(1, (value - edge0) / span))
+        return t * t * (3 - 2 * t)
+    }
+
+    /// The sky hole is the planet as seen from the eye, not a ring fixed
+    /// on the horizon. Climbing shrinks that disk and drops it; the shell
+    /// sits behind the limb so the ground itself is the edge.
+    private func viewerSkyFit(
+        for world: NearbyNavigationTarget,
+        eye: SIMD3<Float>
+    ) -> (lowerElevation: Float, shellRadius: Float, up: SIMD3<Float>) {
+        let rootScale = abs(universeRoot?.scale.x ?? 1)
+        let planetCenter = (universeRoot?.position ?? .zero)
+            + playerAttitude.inverse.act(world.vector) * rootScale
+        var down = planetCenter - eye
+        if simd_length_squared(down) < 1 {
+            down = playerAttitude.inverse.act(world.vector)
+        }
+        let distance = max(simd_length(down), 1)
+        let up = -down / distance
+        let visualRadius = max(1, world.radius * rootScale)
+        let angularRadius = asin(min(0.9995, visualRadius / distance))
+        let limbElevation = angularRadius - .pi / 2
+        let high = max(0, 1 - angularRadius / (.pi / 2))
+        let tuck = min(
+            angularRadius * 0.3,
+            max(0.14, 0.12 + 0.22 * high)
+        )
+        let lowerElevation = max(-.pi / 2 + 0.05, limbElevation - tuck)
+        let limbDistance = sqrt(
+            max(1, distance * distance - visualRadius * visualRadius)
+        )
+        let shellRadius = limbDistance + 40
+        return (lowerElevation, shellRadius, up)
+    }
+
     private func updateAtmosphereEnvironment(
         for world: NearbyNavigationTarget?,
         skyOpacity: Float,
         lightStrength: Float,
-        showSky: Bool
+        showSky: Bool,
+        daylight: Float = 1,
+        sunset: Float = 0
     ) {
         guard let world,
               world.hasAtmosphere,
@@ -5604,33 +5908,107 @@ final class FlightModel {
         }
 
         environment.isEnabled = true
+        if let parent = environment.parent {
+            environment.position =
+                aimAnchorEntity?.position(relativeTo: parent) ?? .zero
+        }
+        let fit = viewerSkyFit(for: world, eye: environment.position)
+        let lowerElevation = fit.lowerElevation
         atmosphereSkyEntity?.isEnabled = showSky
+        if showSky, simd_length_squared(fit.up) > 0.5 {
+            let worldSun = universeStreamer?.nearestStarDirection(
+                from: playerPosition
+            )
+            let sceneSun = worldSun.map {
+                simd_normalize(playerAttitude.inverse.act($0))
+            }
+            atmosphereSkyEntity?.orientation = skyOrientation(
+                up: fit.up,
+                sun: sceneSun
+            )
+            atmosphereSkyEntity?.scale = SIMD3<Float>(
+                repeating: fit.shellRadius
+            )
+            if abs(lowerElevation - lastSkyLimbElevation) > 0.006,
+               var model = atmosphereSkyEntity?.model {
+                model.mesh = SpaceSceneBuilder.makeSkyDomeMesh(
+                    radius: 1,
+                    lowerElevation: lowerElevation
+                )
+                atmosphereSkyEntity?.model = model
+                lastSkyLimbElevation = lowerElevation
+                lastSkyTextureKey = -1
+            }
+        }
         for light in atmosphereLightEntities {
             light.isEnabled = true
         }
         let opacity = max(0, min(1, skyOpacity))
         let quantizedOpacity = (opacity * 100).rounded() / 100
+        let textureKey =
+            Int((sunset * 24).rounded())
+            + Int((daylight * 24).rounded()) * 100
         let kindChanged = lastAtmosphereVisualKind != kind
         if kindChanged
+            || textureKey != lastSkyTextureKey
             || abs(quantizedOpacity - lastAtmosphereVisualOpacity) >= 0.01 {
-            let color = atmosphereColor(for: kind)
-            atmosphereSkyEntity?.model?.materials = [
-                UnlitMaterial(
-                    color: color.withAlphaComponent(
-                        CGFloat(quantizedOpacity)
-                    )
+            var skyMaterial = UnlitMaterial()
+            if let texture = SpaceSceneBuilder.makeAtmosphereSkyTexture(
+                daylight: daylight,
+                sunset: sunset
+            ) {
+                skyMaterial.color = .init(
+                    tint: .white,
+                    texture: .init(texture)
                 )
-            ]
+            } else {
+                skyMaterial.color = .init(
+                    tint: UIColor(red: 0.62, green: 0.78, blue: 1, alpha: 1)
+                )
+            }
+            skyMaterial.blending = .transparent(
+                opacity: .init(floatLiteral: quantizedOpacity)
+            )
+            atmosphereSkyEntity?.model?.materials = [skyMaterial]
             lastAtmosphereVisualOpacity = quantizedOpacity
             lastAtmosphereVisualKind = kind
+            lastSkyTextureKey = textureKey
         }
 
-        let fillColor = atmosphereColor(for: kind)
-        let intensity = 450 + max(0, min(1, lightStrength)) * 4_600
+        let dayFill = SIMD3<Float>(0.75, 0.84, 1)
+        let warmFill = SIMD3<Float>(1, 0.58, 0.34)
+        let fill = dayFill + (warmFill - dayFill) * (sunset * 0.7)
+        let fillColor = UIColor(
+            red: CGFloat(fill.x),
+            green: CGFloat(fill.y),
+            blue: CGFloat(fill.z),
+            alpha: 1
+        )
+        let intensity = max(0, min(1, lightStrength)) * 1_200
         for light in atmosphereLightEntities {
             light.light.color = fillColor
             light.light.intensity = intensity
         }
+    }
+
+    private func skyOrientation(
+        up: SIMD3<Float>,
+        sun: SIMD3<Float>?
+    ) -> simd_quatf {
+        var towardSun = SIMD3<Float>(0, 0, 1)
+        if let sun {
+            towardSun = sun - up * simd_dot(sun, up)
+        }
+        if simd_length_squared(towardSun) < 1e-4 {
+            let helper: SIMD3<Float> =
+                abs(up.x) < 0.9
+                ? SIMD3<Float>(1, 0, 0)
+                : SIMD3<Float>(0, 0, 1)
+            towardSun = simd_cross(helper, up)
+        }
+        towardSun = simd_normalize(towardSun)
+        let right = simd_normalize(simd_cross(up, towardSun))
+        return simd_quatf(simd_float3x3(columns: (right, up, towardSun)))
     }
 
     private func disableAtmosphereEnvironment() {
@@ -5647,23 +6025,8 @@ final class FlightModel {
         atmosphereEnvironmentEntity?.isEnabled = false
         lastAtmosphereVisualOpacity = -1
         lastAtmosphereVisualKind = nil
-    }
-
-    private func atmosphereColor(for kind: CelestialBodyKind) -> UIColor {
-        switch kind {
-        case .star:
-            .white
-        case .ocean:
-            UIColor(red: 0.48, green: 0.76, blue: 1, alpha: 1)
-        case .desert:
-            UIColor(red: 1, green: 0.72, blue: 0.42, alpha: 1)
-        case .rocky:
-            UIColor(red: 0.74, green: 0.78, blue: 0.88, alpha: 1)
-        case .ice:
-            UIColor(red: 0.72, green: 0.95, blue: 1, alpha: 1)
-        case .gas:
-            UIColor(red: 0.78, green: 0.58, blue: 0.96, alpha: 1)
-        }
+        lastSkyLimbElevation = 999
+        lastSkyTextureKey = -1
     }
 
     private func constrainToPlanetSurface(
@@ -5676,7 +6039,9 @@ final class FlightModel {
         }
 
         let vectorAfterMove = world.vector - proposedDelta
-        let minimumDistance = world.radius + 2
+        let minimumDistance =
+            universeStreamer?.shipSurfaceRadius(for: world)
+            ?? world.radius + PlanetSurfaceField.shipSurfaceClearance
         let distanceAfterMove = simd_length(vectorAfterMove)
         let towardCenter = simd_dot(
             proposedDelta,
@@ -5735,11 +6100,10 @@ final class FlightModel {
         previousUp: SIMD3<Float>?,
         traveledDelta: SIMD3<Float>
     ) {
-        guard isWithinPlanetAtmosphere,
+        guard (isWithinPlanetAtmosphere || isInAirlessLandingRange),
               !dominantHandActive,
               let previousUp,
               let world = nearbyWorldForEnvironment,
-              world.hasAtmosphere,
               world.celestialKind != .star,
               world.distance > 0.001,
               simd_length_squared(traveledDelta) > 1e-10
@@ -5773,7 +6137,7 @@ final class FlightModel {
     /// Soft residual bank/pitch cleanup after stick release. Curvature is
     /// already matched to travel; this only eases leftover roll gently.
     private func applyAtmosphericAutoUpright(dt: Float) {
-        guard isWithinPlanetAtmosphere,
+        guard (isWithinPlanetAtmosphere || isInAirlessLandingRange),
               !dominantHandActive,
               let surfaceUpDirection else { return }
 
